@@ -1,0 +1,33 @@
+model:
+  num_colors: 10
+  dim: 64
+  depth: 2
+  heads: 4
+
+train:
+  steps: 600
+  lr: 0.0004
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  device: cpu
+  replay_ratio: 0.4
+  replay_capacity: 512
+  log_every: 100
+
+stream:
+  source: simulator
+  arc_data_dir: ""
+  split: training
+  max_steps: 600
+  seed: 0
+  same_shape_only: false
+  require_test_output: true
+  max_grid_size: 30
+  sim_grid_min_size: 5
+  sim_grid_max_size: 7
+  sim_num_colors: 3
+  sim_min_train_pairs: 3
+  sim_max_train_pairs: 3
+  sim_allowed_rules: ["identity", "flip_h", "flip_v"]
+
+checkpoint_path: checkpoints/unified_arc_easy_sim.pt

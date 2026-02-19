@@ -1,0 +1,44 @@
+model:
+  num_colors: 10
+  dim: 64
+  depth: 2
+  heads: 4
+
+train:
+  steps: 1200
+  lr: 0.00025
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  device: cpu
+  replay_ratio: 0.35
+  replay_capacity: 1024
+  log_every: 100
+  sft_warmup_steps: 500
+  min_sft_weight: 0.30
+  routing_explore_steps: 600
+  routing_explore_floor: 0.20
+  routing_entropy_bonus: 0.03
+  adapt_structure: true
+  adapt_interval: 1
+  grow_threshold: 0.55
+  prune_threshold: 0.12
+  structure_ema_momentum: 0.90
+  hard_expert_cap: 6
+  target_expert_cap: 4
+  expert_budget_coeff: 0.30
+  metrics_jsonl_path: logs/arc_2k_aug_metrics.jsonl
+  rolling_window: 100
+  show_progress_bar: true
+
+stream:
+  source: episodes_jsonl
+  episodes_file: data/arc_200_tasks_2k_episodes.jsonl
+  arc_data_dir: ""
+  split: training
+  max_steps: 1200
+  seed: 11
+  same_shape_only: true
+  require_test_output: true
+  max_grid_size: 30
+
+checkpoint_path: checkpoints/unified_arc_2k_aug.pt

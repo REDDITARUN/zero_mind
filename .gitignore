@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data (large files -- regenerated on Colab)
+data/*.jsonl
+
+# References (cloned separately on Colab)
+References/
+
+# Checkpoints and logs (generated during training)
+checkpoints/
+logs/
+reports/
+
+# Inference previews
+inference_preview*.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.venv/
+venv/

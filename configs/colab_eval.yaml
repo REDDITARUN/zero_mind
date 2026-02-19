@@ -1,0 +1,50 @@
+model:
+  num_colors: 10
+  dim: 128
+  depth: 6
+  heads: 8
+  reasoner_depth: 2
+  h_cycles: 3
+  l_cycles: 2
+  decoder_refine_steps: 6
+  pred_depth: 2
+
+train:
+  steps: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  device: cuda
+  replay_ratio: 0.0
+  replay_capacity: 1
+  log_every: 1
+  sft_warmup_steps: 1
+  min_sft_weight: 0.3
+  routing_explore_steps: 1
+  routing_explore_floor: 0.15
+  routing_entropy_bonus: 0.0
+  adapt_structure: false
+  adapt_interval: 1
+  grow_threshold: 0.6
+  prune_threshold: 0.1
+  structure_ema_momentum: 0.9
+  hard_expert_cap: 6
+  target_expert_cap: 4
+  expert_budget_coeff: 0.25
+  ema_decay: 0.996
+  w_qhalt: 0.5
+  metrics_jsonl_path: logs/eval_placeholder.jsonl
+  rolling_window: 10
+  show_progress_bar: true
+
+stream:
+  source: arc_json
+  arc_data_dir: References/ARC-AGI/data
+  split: evaluation
+  max_steps: 400
+  seed: 123
+  same_shape_only: true
+  require_test_output: true
+  max_grid_size: 30
+
+checkpoint_path: checkpoints/unified_arc_colab.pt
