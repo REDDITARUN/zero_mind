@@ -1,28 +1,28 @@
 model:
   num_colors: 10
-  dim: 128
-  depth: 6
+  dim: 256
+  depth: 8
   heads: 8
-  reasoner_depth: 2
+  reasoner_depth: 3
   h_cycles: 3
   l_cycles: 2
   decoder_refine_steps: 6
   use_mamba: true
-  dino_hidden: 512
-  dino_out: 256
+  dino_hidden: 768
+  dino_out: 384
   symbolic_train_cap: 0.45
   symbolic_infer_cap: 1.0
 
 train:
   steps: 24000
-  lr: 0.0003
+  lr: 0.00025
   weight_decay: 0.0001
   grad_clip: 1.0
   device: cuda
   replay_ratio: 0.45
   replay_capacity: 4096
   log_every: 100
-  lr_warmup_steps: 1500
+  lr_warmup_steps: 2000
   lr_min_ratio: 0.05
   grad_accum_steps: 4
   ema_decay: 0.996
@@ -37,8 +37,8 @@ train:
   hard_expert_cap: 6
   target_expert_cap: 4
   prune_cooldown_steps: 220
-  growth_force_until_step: 1500
-  growth_force_interval: 300
+  growth_force_until_step: 2000
+  growth_force_interval: 400
   growth_force_exact_threshold: 0.25
   expert_budget_coeff: 0.25
   compute_penalty_coeff: 0.0025
