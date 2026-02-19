@@ -7,7 +7,7 @@ model:
   h_cycles: 3
   l_cycles: 2
   decoder_refine_steps: 6
-  use_mamba: true
+  use_mamba: false
   dino_hidden: 768
   dino_out: 384
   symbolic_train_cap: 0.45
