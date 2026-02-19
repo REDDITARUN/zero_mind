@@ -78,16 +78,17 @@ class DraftCorrectDecoder(nn.Module):
             trace.append(self.draft_readout(z))
         draft_logits = trace[-1]
 
-        draft_probs = F.softmax(draft_logits / 0.5, dim=-1)
+        draft_probs = F.softmax(draft_logits, dim=-1)
         draft_latent = draft_probs @ self.draft_embed.weight
         z2 = self.inject_proj(self.inject_norm(torch.cat([z, draft_latent], dim=-1)))
 
         for _ in range(self.correct_steps):
             z2 = self.correct_attn(z2, h=h, w=w)
             z2 = z2 + self.correct_transition(z2)
-            trace.append(self.correct_readout(z2))
 
-        corrected_logits = trace[-1]
+        correction = self.correct_readout(z2)
+        corrected_logits = draft_logits + correction
+        trace.append(corrected_logits)
 
         return DecodeOutput(
             logits=corrected_logits,

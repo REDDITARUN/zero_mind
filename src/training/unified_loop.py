@@ -39,8 +39,10 @@ class TrainConfig:
 
     w_draft: float = 0.5
     w_aux: float = 0.3
+    w_focus: float = 1.0
     w_consistency: float = 0.02
     label_smoothing: float = 0.05
+    loss_clamp: float = 4.0
 
     adapt_structure: bool = True
     adapt_interval: int = 1
@@ -138,8 +140,10 @@ class UnifiedTrainer:
                 lr_warmup_steps=self.cfg.lr_warmup_steps,
                 w_draft=self.cfg.w_draft,
                 w_aux=self.cfg.w_aux,
+                w_focus=self.cfg.w_focus,
                 w_consistency=self.cfg.w_consistency,
                 label_smoothing=self.cfg.label_smoothing,
+                loss_clamp=self.cfg.loss_clamp,
                 expert_budget_coeff=self.cfg.expert_budget_coeff,
                 compute_penalty_coeff=self.cfg.compute_penalty_coeff,
             )
@@ -196,6 +200,7 @@ class UnifiedTrainer:
             "correct": float(loss.l_correct.detach().cpu()),
             "draft": float(loss.l_draft.detach().cpu()),
             "aux": float(loss.l_aux.detach().cpu()),
+            "focus": float(loss.l_focus.detach().cpu()),
             "consistency": float(loss.l_consistency.detach().cpu()),
             "reward": float(loss.reward.cpu()),
             "exact": float(loss.exact_match.cpu()),
@@ -267,6 +272,7 @@ class UnifiedTrainer:
                             "loss": f"{avg.get('total', m['total']):.3f}",
                             "px": f"{avg.get('pixel_acc', m['pixel_acc']):.3f}",
                             "drft": f"{avg.get('draft_acc', m['draft_acc']):.3f}",
+                            "fix": f"{avg.get('pixel_acc', m['pixel_acc']) - avg.get('draft_acc', m['draft_acc']):+.3f}",
                             "exact": f"{avg.get('exact', m['exact']):.3f}",
                             "solved%": f"{m['cumulative_solved_pct']:.1f}",
                             "xprt": f"{avg.get('active_experts', m['active_experts']):.0f}",
@@ -275,16 +281,18 @@ class UnifiedTrainer:
                     )
             if step % self.cfg.log_every == 0:
                 avg = self._summarize_recent()
+                fix_delta = avg.get('pixel_acc', m['pixel_acc']) - avg.get('draft_acc', m['draft_acc'])
                 print(
                     f"step={step} loss={avg.get('total', m['total']):.4f} "
                     f"correct={avg.get('correct', m['correct']):.3f} "
                     f"draft={avg.get('draft', m['draft']):.3f} "
-                    f"aux={avg.get('aux', m['aux']):.3f} "
-                    f"px_acc={avg.get('pixel_acc', m['pixel_acc']):.3f} "
-                    f"drft_acc={avg.get('draft_acc', m['draft_acc']):.3f} "
+                    f"focus={avg.get('focus', m.get('focus', 0)):.3f} "
+                    f"px={avg.get('pixel_acc', m['pixel_acc']):.3f} "
+                    f"drft={avg.get('draft_acc', m['draft_acc']):.3f} "
+                    f"fix={fix_delta:+.3f} "
                     f"exact={avg.get('exact', m['exact']):.3f} "
                     f"solved%={m['cumulative_solved_pct']:.2f} "
-                    f"xperts={avg.get('active_experts', m['active_experts']):.0f} "
+                    f"xprt={avg.get('active_experts', m['active_experts']):.0f} "
                     f"lr={m['lr']:.2e}"
                 )
             if step >= self.cfg.steps:

@@ -147,7 +147,7 @@ def main() -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {total_params:,} params ({trainable:,} trainable)")
     print(f"LR warmup: {train_cfg.lr_warmup_steps} steps, grad_accum: {train_cfg.grad_accum_steps}")
-    print(f"Loss: Correct + {train_cfg.w_draft}*draft + {train_cfg.w_aux}*aux (label_smooth={train_cfg.label_smoothing})")
+    print(f"Loss: Correct + {train_cfg.w_draft}*draft + {train_cfg.w_aux}*aux + {train_cfg.w_focus}*focus (smooth={train_cfg.label_smoothing}, clamp={train_cfg.loss_clamp})")
     print(f"AMP: {train_cfg.use_amp} | Training {train_cfg.steps} steps on {train_cfg.device}")
 
     try:
@@ -172,11 +172,12 @@ def main() -> None:
         if pbar is not None:
             pbar.update(1)
             if step % max(1, train_cfg.log_every // 2) == 0:
-                pbar.set_postfix(
+                    pbar.set_postfix(
                     {
                         "loss": f"{m['total']:.3f}",
                         "px": f"{m['pixel_acc']:.3f}",
                         "drft": f"{m['draft_acc']:.3f}",
+                        "fix": f"{m['pixel_acc'] - m['draft_acc']:+.3f}",
                         "exact": f"{m['exact']:.3f}",
                         "solved%": f"{m['cumulative_solved_pct']:.2f}",
                         "xprt": f"{m['active_experts']:.0f}",
@@ -184,12 +185,13 @@ def main() -> None:
                 )
 
         if step % train_cfg.log_every == 0:
+            fix_delta = m['pixel_acc'] - m['draft_acc']
             print(
                 f"step={step} loss={m['total']:.4f} correct={m['correct']:.3f} "
-                f"draft={m.get('draft', 0):.3f} aux={m.get('aux', 0):.3f} "
-                f"px_acc={m['pixel_acc']:.3f} drft_acc={m['draft_acc']:.3f} "
+                f"draft={m.get('draft', 0):.3f} focus={m.get('focus', 0):.3f} "
+                f"px={m['pixel_acc']:.3f} drft={m['draft_acc']:.3f} fix={fix_delta:+.3f} "
                 f"exact={m['exact']:.3f} "
-                f"solved%={m['cumulative_solved_pct']:.2f} xperts={m['active_experts']:.0f} lr={m['lr']:.2e}"
+                f"solved%={m['cumulative_solved_pct']:.2f} xprt={m['active_experts']:.0f} lr={m['lr']:.2e}"
             )
 
         if step % max(1, args.eval_every) == 0:
