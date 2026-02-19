@@ -5,6 +5,7 @@ from typing import List
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from src.models.ijepa_rope import RopeAttentionBlock
 
@@ -12,77 +13,85 @@ from src.models.ijepa_rope import RopeAttentionBlock
 @dataclass
 class DecodeOutput:
     logits: torch.Tensor
+    draft_logits: torch.Tensor
     logits_trace: List[torch.Tensor]
     refinement_steps: int
 
 
-class ContentDecoder(nn.Module):
-    """Cross-attention content generator with diffusion-style iterative refinement.
+class DraftCorrectDecoder(nn.Module):
+    """Two-stage decoder inspired by System 1 / System 2 cognition.
 
-    Creates a canvas of output-size tokens (with learned 2D positional encoding),
-    then iteratively refines them by:
-      1. Cross-attending to the reasoned source latent (pull information)
-      2. Self-attending with 2D RoPE (enforce spatial consistency)
-      3. MLP transition (non-linear refinement)
+    Stage 1 — Draft (System 1):
+      Fast MLP refinement on the SAME tokens from the reasoner.
+      Each token directly maps to a spatial position in the output grid.
+      Strong, easy gradients; shared transition weights across steps.
 
-    All weights are shared across refinement steps (true diffusion-style).
-    Supports arbitrary output sizes up to max_grid × max_grid.
+    Stage 2 — Correct (System 2):
+      Soft-embed the draft prediction back into latent space,
+      fuse with the refined reasoning state, then apply
+      self-attention with 2D RoPE to detect and fix spatial errors.
+      Shared weights across correction steps (diffusion-style).
+
+    The draft gives an easy learning signal (direct gradient path).
+    The corrector learns to find and fix specific mistakes.
+    Final output = corrected logits (residual on top of draft).
     """
 
     def __init__(
         self,
         dim: int = 256,
         num_colors: int = 10,
-        refine_steps: int = 6,
+        draft_steps: int = 3,
+        correct_steps: int = 3,
         heads: int = 8,
-        max_grid: int = 30,
     ) -> None:
         super().__init__()
-        self.refine_steps = refine_steps
+        self.draft_steps = draft_steps
+        self.correct_steps = correct_steps
 
-        self.canvas_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.row_embed = nn.Embedding(max_grid, dim)
-        self.col_embed = nn.Embedding(max_grid, dim)
-
-        self.cross_norm_q = nn.LayerNorm(dim)
-        self.cross_norm_kv = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, heads, batch_first=True)
-
-        self.self_attn = RopeAttentionBlock(dim=dim, heads=heads)
-
-        self.transition = nn.Sequential(
+        self.draft_transition = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim * 2),
             nn.GELU(),
             nn.Linear(dim * 2, dim),
         )
+        self.draft_readout = nn.Linear(dim, num_colors)
 
-        self.readout = nn.Linear(dim, num_colors)
+        self.draft_embed = nn.Embedding(num_colors, dim)
+        self.inject_norm = nn.LayerNorm(dim * 2)
+        self.inject_proj = nn.Linear(dim * 2, dim)
+        self.correct_attn = RopeAttentionBlock(dim=dim, heads=heads)
+        self.correct_transition = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.correct_readout = nn.Linear(dim, num_colors)
 
-    def forward(self, source_latent: torch.Tensor, h_out: int, w_out: int) -> DecodeOutput:
-        b = source_latent.shape[0]
-        t_out = h_out * w_out
-        device = source_latent.device
-
-        rows = torch.arange(h_out, device=device).repeat_interleave(w_out)
-        cols = torch.arange(w_out, device=device).repeat(h_out)
-        pos = self.row_embed(rows) + self.col_embed(cols)
-        z = self.canvas_token.expand(b, t_out, -1) + pos.unsqueeze(0)
-
+    def forward(self, latent: torch.Tensor, h: int, w: int) -> DecodeOutput:
+        z = latent
         trace: List[torch.Tensor] = []
-        for _ in range(self.refine_steps):
-            q = self.cross_norm_q(z)
-            kv = self.cross_norm_kv(source_latent)
-            attn_out, _ = self.cross_attn(q, kv, kv)
-            z = z + attn_out
 
-            z = self.self_attn(z, h=h_out, w=w_out)
-            z = z + self.transition(z)
+        for _ in range(self.draft_steps):
+            z = z + self.draft_transition(z)
+            trace.append(self.draft_readout(z))
+        draft_logits = trace[-1]
 
-            trace.append(self.readout(z))
+        draft_probs = F.softmax(draft_logits / 0.5, dim=-1)
+        draft_latent = draft_probs @ self.draft_embed.weight
+        z2 = self.inject_proj(self.inject_norm(torch.cat([z, draft_latent], dim=-1)))
+
+        for _ in range(self.correct_steps):
+            z2 = self.correct_attn(z2, h=h, w=w)
+            z2 = z2 + self.correct_transition(z2)
+            trace.append(self.correct_readout(z2))
+
+        corrected_logits = trace[-1]
 
         return DecodeOutput(
-            logits=trace[-1],
+            logits=corrected_logits,
+            draft_logits=draft_logits,
             logits_trace=trace,
-            refinement_steps=self.refine_steps,
+            refinement_steps=self.draft_steps + self.correct_steps,
         )

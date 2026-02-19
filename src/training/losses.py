@@ -11,8 +11,8 @@ from src.models.unified_model import UnifiedForwardOutput
 @dataclass
 class LossBreakdown:
     total: torch.Tensor
-    l_content: torch.Tensor
-    l_shape: torch.Tensor
+    l_correct: torch.Tensor
+    l_draft: torch.Tensor
     l_aux: torch.Tensor
     l_consistency: torch.Tensor
     reward: torch.Tensor
@@ -29,24 +29,21 @@ def compute_unified_loss(
     target_grid: torch.Tensor,
     step: int,
     total_steps: int,
-    lr_warmup_steps: int = 1000,
-    w_shape: float = 0.3,
+    lr_warmup_steps: int = 500,
+    w_draft: float = 0.5,
     w_aux: float = 0.3,
     w_consistency: float = 0.02,
+    label_smoothing: float = 0.05,
     compute_penalty_coeff: float = 0.01,
     expert_budget_coeff: float = 0.25,
     **_kwargs,
 ) -> LossBreakdown:
     device = target_grid.device
+    target = target_grid.unsqueeze(0)
 
-    l_content = F.cross_entropy(out.test_logits, target_grid.unsqueeze(0))
-
-    true_h, true_w = target_grid.shape
-    l_shape_h = F.cross_entropy(out.shape_h_logits, torch.tensor([true_h - 1], device=device))
-    l_shape_w = F.cross_entropy(out.shape_w_logits, torch.tensor([true_w - 1], device=device))
-    l_shape = (l_shape_h + l_shape_w) * 0.5
-
-    l_aux = F.cross_entropy(out.aux_logits, target_grid.unsqueeze(0))
+    l_correct = F.cross_entropy(out.test_logits, target, label_smoothing=label_smoothing)
+    l_draft = F.cross_entropy(out.draft_logits, target, label_smoothing=label_smoothing)
+    l_aux = F.cross_entropy(out.aux_logits, target)
 
     if len(out.decoder.logits_trace) > 1:
         diffs = []
@@ -58,17 +55,17 @@ def compute_unified_loss(
 
     exact = _exact_match(out.test_logits, target_grid)
     pixel_acc = (out.test_logits.argmax(dim=1).squeeze(0) == target_grid).float().mean()
-    compute_cost = compute_penalty_coeff * (out.reasoner.steps_used + out.decoder.refinement_steps)
+    compute_cost = compute_penalty_coeff * out.decoder.refinement_steps
     reward = exact + 0.5 * pixel_acc - compute_cost
 
     ramp = min(1.0, step / max(1, lr_warmup_steps))
 
-    total = l_content + ramp * w_shape * l_shape + ramp * w_aux * l_aux + w_consistency * l_consistency
+    total = l_correct + ramp * w_draft * l_draft + ramp * w_aux * l_aux + w_consistency * l_consistency
 
     return LossBreakdown(
         total=total,
-        l_content=l_content,
-        l_shape=l_shape,
+        l_correct=l_correct,
+        l_draft=l_draft,
         l_aux=l_aux,
         l_consistency=l_consistency,
         reward=reward.detach(),

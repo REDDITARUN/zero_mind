@@ -17,10 +17,10 @@ def test_single_train_step_runs() -> None:
     metrics = trainer.train_step(ep, step=1)
 
     assert "total" in metrics
-    assert "content" in metrics
-    assert "shape" in metrics
+    assert "correct" in metrics
+    assert "draft" in metrics
     assert "aux" in metrics
-    assert "shape_correct" in metrics
+    assert "draft_acc" in metrics
     assert 0.0 <= metrics["alpha_sft"] <= 1.0
     assert 0.0 <= metrics["alpha_rl"] <= 1.0
 

@@ -29,17 +29,19 @@ class TrainConfig:
     rolling_window: int = 50
     show_progress_bar: bool = True
 
-    lr_warmup_steps: int = 1000
+    lr_warmup_steps: int = 500
     lr_min_ratio: float = 0.05
 
     grad_accum_steps: int = 4
 
-    # Loss weights
-    w_shape: float = 0.3
+    use_amp: bool = False
+    compile_model: bool = False
+
+    w_draft: float = 0.5
     w_aux: float = 0.3
     w_consistency: float = 0.02
+    label_smoothing: float = 0.05
 
-    # Structure adaptation
     adapt_structure: bool = True
     adapt_interval: int = 1
     grow_threshold: float = 0.55
@@ -57,6 +59,7 @@ class TrainConfig:
     # Legacy compat — accepted but ignored
     ema_decay: float = 0.996
     w_dino: float = 0.0
+    w_shape: float = 0.0
     sft_warmup_steps: int = 0
     min_sft_weight: float = 0.0
     sft_refresh_interval: int = 0
@@ -81,6 +84,17 @@ class UnifiedTrainer:
     def __init__(self, model: UnifiedArcModel, cfg: TrainConfig) -> None:
         self.model = model.to(cfg.device)
         self.cfg = cfg
+
+        self._use_amp = cfg.use_amp and cfg.device.startswith("cuda")
+        self._amp_dtype = torch.bfloat16
+
+        if cfg.compile_model and cfg.device.startswith("cuda"):
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("torch.compile enabled (reduce-overhead)")
+            except Exception as e:
+                print(f"torch.compile failed ({e}), using eager mode")
+
         self.optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.failure_replay: deque[ArcEpisode] = deque(maxlen=cfg.replay_capacity)
         self.rng = random.Random(0)
@@ -109,23 +123,26 @@ class UnifiedTrainer:
         self.model.train()
         current_lr = self._set_lr(step)
 
-        out = self.model(
-            train_inputs=episode.train_inputs,
-            train_outputs=episode.train_outputs,
-            test_input=episode.test_input,
-        )
-        loss = compute_unified_loss(
-            out,
-            episode.test_output,
-            step=step,
-            total_steps=self.cfg.steps,
-            lr_warmup_steps=self.cfg.lr_warmup_steps,
-            w_shape=self.cfg.w_shape,
-            w_aux=self.cfg.w_aux,
-            w_consistency=self.cfg.w_consistency,
-            expert_budget_coeff=self.cfg.expert_budget_coeff,
-            compute_penalty_coeff=self.cfg.compute_penalty_coeff,
-        )
+        device_type = "cuda" if self.cfg.device.startswith("cuda") else "cpu"
+        with torch.amp.autocast(device_type, dtype=self._amp_dtype, enabled=self._use_amp):
+            out = self.model(
+                train_inputs=episode.train_inputs,
+                train_outputs=episode.train_outputs,
+                test_input=episode.test_input,
+            )
+            loss = compute_unified_loss(
+                out,
+                episode.test_output,
+                step=step,
+                total_steps=self.cfg.steps,
+                lr_warmup_steps=self.cfg.lr_warmup_steps,
+                w_draft=self.cfg.w_draft,
+                w_aux=self.cfg.w_aux,
+                w_consistency=self.cfg.w_consistency,
+                label_smoothing=self.cfg.label_smoothing,
+                expert_budget_coeff=self.cfg.expert_budget_coeff,
+                compute_penalty_coeff=self.cfg.compute_penalty_coeff,
+            )
 
         scaled_loss = loss.total / self.cfg.grad_accum_steps
         scaled_loss.backward()
@@ -170,29 +187,25 @@ class UnifiedTrainer:
         if loss.exact_match.item() < 1.0:
             self.failure_replay.append(episode)
 
-        # Shape accuracy
-        true_h, true_w = episode.test_output.shape
-        pred_h = int(out.shape_h_logits.argmax(dim=-1).item()) + 1
-        pred_w = int(out.shape_w_logits.argmax(dim=-1).item()) + 1
-        shape_correct = float(pred_h == true_h and pred_w == true_w)
+        draft_acc = float(
+            (out.draft_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()
+        )
 
         return {
             "total": float(loss.total.detach().cpu()),
-            "content": float(loss.l_content.detach().cpu()),
-            "shape": float(loss.l_shape.detach().cpu()),
+            "correct": float(loss.l_correct.detach().cpu()),
+            "draft": float(loss.l_draft.detach().cpu()),
             "aux": float(loss.l_aux.detach().cpu()),
             "consistency": float(loss.l_consistency.detach().cpu()),
             "reward": float(loss.reward.cpu()),
             "exact": float(loss.exact_match.cpu()),
             "pixel_acc": float((out.test_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()),
-            "shape_correct": shape_correct,
+            "draft_acc": draft_acc,
             "lr": current_lr,
             "alpha_sft": float(out.router.alpha_sft.mean().detach().cpu()),
             "alpha_rl": float(out.router.alpha_rl.mean().detach().cpu()),
             "novelty": float(out.router.novelty.mean().detach().cpu()),
             "uncertainty": float(out.router.uncertainty.mean().detach().cpu()),
-            "steps_reasoner": float(out.reasoner.steps_used),
-            "steps_shape_reasoner": float(out.shape_reasoner.steps_used),
             "steps_refine": float(out.decoder.refinement_steps),
             "active_experts": float(out.reasoner.active_experts),
             "grew": float(grown),
@@ -204,8 +217,8 @@ class UnifiedTrainer:
         if not self.recent:
             return {}
         keys = [
-            "total", "content", "shape", "aux", "exact", "pixel_acc",
-            "shape_correct", "novelty", "uncertainty", "active_experts",
+            "total", "correct", "draft", "aux", "exact", "pixel_acc",
+            "draft_acc", "novelty", "uncertainty", "active_experts",
             "symbolic_confidence",
         ]
         out: Dict[str, float] = {}
@@ -252,12 +265,11 @@ class UnifiedTrainer:
                     pbar.set_postfix(
                         {
                             "loss": f"{avg.get('total', m['total']):.3f}",
-                            "ct": f"{avg.get('content', m['content']):.3f}",
                             "px": f"{avg.get('pixel_acc', m['pixel_acc']):.3f}",
+                            "drft": f"{avg.get('draft_acc', m['draft_acc']):.3f}",
                             "exact": f"{avg.get('exact', m['exact']):.3f}",
-                            "shp": f"{avg.get('shape_correct', m['shape_correct']):.2f}",
                             "solved%": f"{m['cumulative_solved_pct']:.1f}",
-                            "xperts": f"{avg.get('active_experts', m['active_experts']):.0f}",
+                            "xprt": f"{avg.get('active_experts', m['active_experts']):.0f}",
                             "lr": f"{m['lr']:.1e}",
                         }
                     )
@@ -265,12 +277,12 @@ class UnifiedTrainer:
                 avg = self._summarize_recent()
                 print(
                     f"step={step} loss={avg.get('total', m['total']):.4f} "
-                    f"content={avg.get('content', m['content']):.3f} "
-                    f"shape={avg.get('shape', m['shape']):.3f} "
+                    f"correct={avg.get('correct', m['correct']):.3f} "
+                    f"draft={avg.get('draft', m['draft']):.3f} "
                     f"aux={avg.get('aux', m['aux']):.3f} "
                     f"px_acc={avg.get('pixel_acc', m['pixel_acc']):.3f} "
+                    f"drft_acc={avg.get('draft_acc', m['draft_acc']):.3f} "
                     f"exact={avg.get('exact', m['exact']):.3f} "
-                    f"shp_acc={avg.get('shape_correct', m['shape_correct']):.2f} "
                     f"solved%={m['cumulative_solved_pct']:.2f} "
                     f"xperts={avg.get('active_experts', m['active_experts']):.0f} "
                     f"lr={m['lr']:.2e}"

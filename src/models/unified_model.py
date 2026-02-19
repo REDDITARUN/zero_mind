@@ -11,59 +11,41 @@ from src.models.ijepa_rope import IJepaEncoder2DRoPE
 from src.models.cross_attention_rule import CrossAttentionRuleExtractor
 from src.models.router import NoveltyRouter, RouterOutput
 from src.models.reasoner_trm_hrm import TrmHrmReasoner, ReasonerOutput
-from src.models.decoder_refine import ContentDecoder, DecodeOutput
+from src.models.decoder_refine import DraftCorrectDecoder, DecodeOutput
 from src.models.symbolic_primitives import fit_symbolic_rule
-
-
-class ShapePredictor(nn.Module):
-    """Predicts output grid dimensions from pooled shape-reasoner latent.
-
-    Classifies H and W independently over [1, max_size].
-    """
-
-    def __init__(self, dim: int = 256, max_size: int = 30) -> None:
-        super().__init__()
-        self.max_size = max_size
-        self.norm = nn.LayerNorm(dim)
-        self.h_head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, max_size))
-        self.w_head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, max_size))
-
-    def forward(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pooled = self.norm(latent.mean(dim=1))
-        return self.h_head(pooled), self.w_head(pooled)
 
 
 @dataclass
 class UnifiedForwardOutput:
     test_logits: torch.Tensor
+    draft_logits: torch.Tensor
     aux_logits: torch.Tensor
-    shape_h_logits: torch.Tensor
-    shape_w_logits: torch.Tensor
     router: RouterOutput
-    reasoner: ReasonerOutput          # content reasoner (backward compat)
-    shape_reasoner: ReasonerOutput
+    reasoner: ReasonerOutput
     decoder: DecodeOutput
     test_shape: torch.Size
-    target_shape: tuple[int, int]
     symbolic_confidence: torch.Tensor
     symbolic_rule: str
 
 
 class UnifiedArcModel(nn.Module):
-    """v3: Dual-Head HRM + Cross-Attention Content Decoder.
+    """v4: HRM + Draft-Correct Decoder (System 1 + System 2).
 
     Architecture:
       Encoder (RoPE Attention) → Cross-Attention Rule Extractor →
-        ┌── Content Reasoner (full HRM: deep H/L cycles) → Content Decoder
-        └── Shape Reasoner (lightweight HRM) → Shape Predictor (H, W)
+        Content Reasoner (HRM: H/L cycles with 1-step grad trick) →
+        Draft-Correct Decoder:
+          Stage 1 — Draft: fast MLP refinement (strong gradients)
+          Stage 2 — Correct: re-inject draft, self-attend to fix errors
       + Auxiliary direct readout (gradient shortcut for encoder)
-      + Symbolic blend
+      + Symbolic blend at inference
 
-    Key changes from v2:
-      - No DINO (removed target encoder + projection heads)
-      - Dual parallel HRM loops (brain-inspired "what" + "where" pathways)
-      - Cross-attention content decoder (canvas + diffusion-style refinement)
-      - Shape predictor (prepares for variable-size output support)
+    Key changes from v3:
+      - Removed shape reasoner/predictor (wasted compute for same-shape)
+      - DraftCorrectDecoder replaces CrossAttn ContentDecoder
+        (direct token refinement >> generating from scratch canvas)
+      - Two learning signals: draft loss + corrector loss
+      - Simpler, faster, stronger gradients
     """
 
     def __init__(
@@ -72,22 +54,14 @@ class UnifiedArcModel(nn.Module):
         dim: int = 256,
         depth: int = 8,
         heads: int = 8,
-        # Content reasoner — separate H and L levels (faithful HRM)
         h_layers: int = 3,
         l_layers: int = 3,
         h_cycles: int = 3,
         l_cycles: int = 2,
-        # Shape reasoner (lightweight parallel loop)
-        shape_h_layers: int = 1,
-        shape_l_layers: int = 1,
-        shape_h_cycles: int = 1,
-        shape_l_cycles: int = 1,
-        # Content decoder
-        decoder_refine_steps: int = 6,
-        # Encoder options
+        draft_steps: int = 3,
+        correct_steps: int = 3,
         use_mamba: bool = False,
-        # Symbolic
-        symbolic_train_cap: float = 0.45,
+        symbolic_train_cap: float = 0.0,
         symbolic_infer_cap: float = 1.0,
         # Legacy compat — silently ignored
         dino_hidden: int = 0,
@@ -96,6 +70,11 @@ class UnifiedArcModel(nn.Module):
         reasoner_max_steps: int | None = None,
         reasoner_depth: int | None = None,
         shape_reasoner_depth: int | None = None,
+        shape_h_layers: int | None = None,
+        shape_l_layers: int | None = None,
+        shape_h_cycles: int | None = None,
+        shape_l_cycles: int | None = None,
+        decoder_refine_steps: int | None = None,
     ) -> None:
         super().__init__()
         self.encoder = IJepaEncoder2DRoPE(
@@ -111,18 +90,11 @@ class UnifiedArcModel(nn.Module):
         self.content_reasoner = TrmHrmReasoner(
             dim=dim, h_layers=_h, l_layers=_l, h_cycles=h_cycles, l_cycles=l_cycles, heads=heads,
         )
-        _sh = shape_h_layers if shape_reasoner_depth is None else shape_reasoner_depth
-        _sl = shape_l_layers if shape_reasoner_depth is None else shape_reasoner_depth
-        self.shape_reasoner = TrmHrmReasoner(
-            dim=dim, h_layers=_sh, l_layers=_sl,
-            h_cycles=shape_h_cycles, l_cycles=shape_l_cycles,
-            heads=heads, max_experts=2, init_active_experts=1,
-        )
 
-        self.shape_predictor = ShapePredictor(dim=dim, max_size=30)
-
-        self.decoder = ContentDecoder(
-            dim=dim, num_colors=num_colors, refine_steps=decoder_refine_steps, heads=heads,
+        _ds = draft_steps if decoder_refine_steps is None else max(1, decoder_refine_steps // 2)
+        _cs = correct_steps if decoder_refine_steps is None else max(1, decoder_refine_steps - _ds)
+        self.decoder = DraftCorrectDecoder(
+            dim=dim, num_colors=num_colors, draft_steps=_ds, correct_steps=_cs, heads=heads,
         )
 
         self.aux_readout = nn.Linear(dim, num_colors)
@@ -184,18 +156,12 @@ class UnifiedArcModel(nn.Module):
 
         h_in, w_in = test_input.shape
 
-        # Dual HRM: two parallel reasoning pathways
         content_out = self.content_reasoner(rule_out.test_conditioned_latent, h=h_in, w=w_in)
-        shape_out = self.shape_reasoner(rule_out.test_conditioned_latent, h=h_in, w=w_in)
 
-        shape_h_logits, shape_w_logits = self.shape_predictor(shape_out.latent)
+        decode_out = self.decoder(content_out.latent, h=h_in, w=w_in)
 
-        h_out, w_out = h_in, w_in
-        target_shape = (h_out, w_out)
-
-        decode_out = self.decoder(content_out.latent, h_out, w_out)
-
-        neural_logits = decode_out.logits.reshape(1, h_out, w_out, -1).permute(0, 3, 1, 2)
+        neural_logits = decode_out.logits.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
+        draft_logits_2d = decode_out.draft_logits.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
 
         aux_logits_raw = self.aux_readout(rule_out.test_conditioned_latent)
         aux_logits = aux_logits_raw.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
@@ -210,15 +176,12 @@ class UnifiedArcModel(nn.Module):
 
         return UnifiedForwardOutput(
             test_logits=test_logits,
+            draft_logits=draft_logits_2d,
             aux_logits=aux_logits,
-            shape_h_logits=shape_h_logits,
-            shape_w_logits=shape_w_logits,
             router=router_out,
             reasoner=content_out,
-            shape_reasoner=shape_out,
             decoder=decode_out,
             test_shape=test_input.shape,
-            target_shape=target_shape,
             symbolic_confidence=torch.tensor(sym_w, device=test_input.device),
             symbolic_rule=sym.rule_name,
         )

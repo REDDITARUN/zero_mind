@@ -7,11 +7,8 @@ model:
   l_layers: 1
   h_cycles: 2
   l_cycles: 2
-  shape_h_layers: 1
-  shape_l_layers: 1
-  shape_h_cycles: 1
-  shape_l_cycles: 1
-  decoder_refine_steps: 2
+  draft_steps: 2
+  correct_steps: 2
   use_mamba: false
 
 train:
@@ -26,9 +23,12 @@ train:
   lr_warmup_steps: 20
   lr_min_ratio: 0.05
   grad_accum_steps: 1
-  w_shape: 0.3
+  use_amp: false
+  compile_model: false
+  w_draft: 0.5
   w_aux: 0.3
   w_consistency: 0.02
+  label_smoothing: 0.05
   adapt_structure: true
   adapt_interval: 1
   grow_threshold: 0.55

@@ -147,8 +147,8 @@ def main() -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {total_params:,} params ({trainable:,} trainable)")
     print(f"LR warmup: {train_cfg.lr_warmup_steps} steps, grad_accum: {train_cfg.grad_accum_steps}")
-    print(f"Loss: Content + {train_cfg.w_shape}*shape + {train_cfg.w_aux}*aux + {train_cfg.w_consistency}*consistency")
-    print(f"Training {train_cfg.steps} steps on {train_cfg.device}")
+    print(f"Loss: Correct + {train_cfg.w_draft}*draft + {train_cfg.w_aux}*aux (label_smooth={train_cfg.label_smoothing})")
+    print(f"AMP: {train_cfg.use_amp} | Training {train_cfg.steps} steps on {train_cfg.device}")
 
     try:
         from tqdm import tqdm
@@ -175,21 +175,20 @@ def main() -> None:
                 pbar.set_postfix(
                     {
                         "loss": f"{m['total']:.3f}",
-                        "ct": f"{m['content']:.3f}",
                         "px": f"{m['pixel_acc']:.3f}",
+                        "drft": f"{m['draft_acc']:.3f}",
                         "exact": f"{m['exact']:.3f}",
-                        "shp": f"{m['shape_correct']:.2f}",
                         "solved%": f"{m['cumulative_solved_pct']:.2f}",
-                        "xperts": f"{m['active_experts']:.0f}",
+                        "xprt": f"{m['active_experts']:.0f}",
                     }
                 )
 
         if step % train_cfg.log_every == 0:
             print(
-                f"step={step} loss={m['total']:.4f} content={m['content']:.3f} "
-                f"shape={m.get('shape', 0):.3f} aux={m.get('aux', 0):.3f} "
-                f"px_acc={m['pixel_acc']:.3f} exact={m['exact']:.3f} "
-                f"shp_acc={m['shape_correct']:.2f} "
+                f"step={step} loss={m['total']:.4f} correct={m['correct']:.3f} "
+                f"draft={m.get('draft', 0):.3f} aux={m.get('aux', 0):.3f} "
+                f"px_acc={m['pixel_acc']:.3f} drft_acc={m['draft_acc']:.3f} "
+                f"exact={m['exact']:.3f} "
                 f"solved%={m['cumulative_solved_pct']:.2f} xperts={m['active_experts']:.0f} lr={m['lr']:.2e}"
             )
 
