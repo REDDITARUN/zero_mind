@@ -15,9 +15,7 @@ class DecodeOutput:
 
 
 class IterativeRefinementDecoder(nn.Module):
-    """
-    Diffusion-inspired iterative correction in latent space.
-    """
+    """Diffusion-inspired iterative correction in latent space."""
 
     def __init__(self, dim: int = 256, num_colors: int = 10, refine_steps: int = 4) -> None:
         super().__init__()
@@ -30,16 +28,12 @@ class IterativeRefinementDecoder(nn.Module):
         )
         self.readout = nn.Linear(dim, num_colors)
 
-    def forward(self, latent: torch.Tensor, route_control: torch.Tensor) -> DecodeOutput:
-        # route_control[:,1] (RL emphasis) increases refinement budget.
-        rl_strength = route_control[:, 1].mean().item()
-        steps = max(2, int(self.refine_steps * (0.5 + 0.5 * rl_strength)))
-
+    def forward(self, latent: torch.Tensor) -> DecodeOutput:
         z = latent
         trace: List[torch.Tensor] = []
-        for _ in range(steps):
+        for _ in range(self.refine_steps):
             delta = self.transition(z)
             z = z + delta
             trace.append(self.readout(z))
 
-        return DecodeOutput(logits=trace[-1], logits_trace=trace, refinement_steps=steps)
+        return DecodeOutput(logits=trace[-1], logits_trace=trace, refinement_steps=self.refine_steps)

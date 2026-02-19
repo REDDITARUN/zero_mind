@@ -78,7 +78,11 @@ class RopeAttentionBlock(nn.Module):
 
 
 class IJepaEncoder2DRoPE(nn.Module):
-    """Pure encoder -- produces latent tokens from grid. No self-supervised loss."""
+    """Pure encoder -- produces latent tokens from grid.
+
+    When use_mamba=True, alternates attention blocks (global/spatial via 2D RoPE)
+    with Mamba blocks (sequential/selective scanning).
+    """
 
     def __init__(
         self,
@@ -86,48 +90,71 @@ class IJepaEncoder2DRoPE(nn.Module):
         dim: int = 256,
         depth: int = 6,
         heads: int = 8,
+        use_mamba: bool = False,
     ) -> None:
         super().__init__()
         self.color_embed = nn.Embedding(num_colors, dim)
-        self.blocks = nn.ModuleList([RopeAttentionBlock(dim=dim, heads=heads) for _ in range(depth)])
+        self.use_mamba = use_mamba
+
+        if use_mamba:
+            from src.models.mamba_block import BiMambaBlock
+
+            blocks: list[nn.Module] = []
+            for i in range(depth):
+                if i % 2 == 0:
+                    blocks.append(BiMambaBlock(dim=dim))
+                else:
+                    blocks.append(RopeAttentionBlock(dim=dim, heads=heads))
+            self.blocks = nn.ModuleList(blocks)
+            self._block_types = ["mamba" if i % 2 == 0 else "attn" for i in range(depth)]
+        else:
+            self.blocks = nn.ModuleList([RopeAttentionBlock(dim=dim, heads=heads) for _ in range(depth)])
+            self._block_types = ["attn"] * depth
 
     def forward(self, grid_tokens: torch.Tensor) -> torch.Tensor:
         """grid_tokens: [B, H, W] -> latent_tokens: [B, H*W, D]"""
         b, h, w = grid_tokens.shape
         x = self.color_embed(grid_tokens)
         x = flatten_hw(x)
-        for blk in self.blocks:
-            x = blk(x, h=h, w=w)
+        for blk, btype in zip(self.blocks, self._block_types):
+            if btype == "mamba":
+                x = blk(x)
+            else:
+                x = blk(x, h=h, w=w)
         return x
 
 
-class IJepaPredictor(nn.Module):
-    """Lightweight predictor for I-JEPA self-supervised loss.
+class DINOHead(nn.Module):
+    """DINO projection head for self-distillation.
 
-    Takes context latents (with mask tokens at target positions),
-    runs through a small transformer, and outputs predicted latents
-    at the target positions.
+    Projects pooled latent to a prototypical space where
+    teacher-student distillation produces stable representations.
     """
 
-    def __init__(self, dim: int = 256, depth: int = 2, heads: int = 8) -> None:
+    def __init__(self, dim: int = 256, hidden_dim: int = 512, out_dim: int = 256) -> None:
         super().__init__()
-        self.proj_in = nn.Linear(dim, dim)
-        self.mask_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.blocks = nn.ModuleList([RopeAttentionBlock(dim=dim, heads=heads) for _ in range(depth)])
-        self.proj_out = nn.Linear(dim, dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_dim),
+        )
 
-    def forward(
-        self,
-        context_latent: torch.Tensor,
-        target_indices: torch.Tensor,
-        h: int,
-        w: int,
-    ) -> torch.Tensor:
-        x = self.proj_in(context_latent)
-        b, t, d = x.shape
-        mask_tokens = self.mask_token.expand(b, target_indices.shape[0], d)
-        x = x.clone()
-        x[:, target_indices] = mask_tokens
-        for blk in self.blocks:
-            x = blk(x, h=h, w=w)
-        return self.proj_out(x[:, target_indices])
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+def dino_loss(
+    student_out: torch.Tensor,
+    teacher_out: torch.Tensor,
+    center: torch.Tensor,
+    student_temp: float = 0.1,
+    teacher_temp: float = 0.07,
+) -> torch.Tensor:
+    """DINO cross-entropy loss with centering + sharpening."""
+    teacher_probs = F.softmax((teacher_out - center) / teacher_temp, dim=-1)
+    student_log_probs = F.log_softmax(student_out / student_temp, dim=-1)
+    return -torch.sum(teacher_probs * student_log_probs, dim=-1).mean()

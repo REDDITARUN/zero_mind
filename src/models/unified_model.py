@@ -8,7 +8,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from src.models.ijepa_rope import IJepaEncoder2DRoPE, IJepaPredictor
+from src.models.ijepa_rope import IJepaEncoder2DRoPE, DINOHead, dino_loss
 from src.models.cross_attention_rule import CrossAttentionRuleExtractor
 from src.models.router import NoveltyRouter, RouterOutput
 from src.models.reasoner_trm_hrm import TrmHrmReasoner, ReasonerOutput
@@ -19,7 +19,8 @@ from src.models.symbolic_primitives import fit_symbolic_rule
 @dataclass
 class UnifiedForwardOutput:
     test_logits: torch.Tensor
-    ijepa_loss: torch.Tensor
+    aux_logits: torch.Tensor
+    dino_loss: torch.Tensor
     router: RouterOutput
     reasoner: ReasonerOutput
     decoder: DecodeOutput
@@ -39,25 +40,35 @@ class UnifiedArcModel(nn.Module):
         h_cycles: int = 3,
         l_cycles: int = 2,
         decoder_refine_steps: int = 4,
-        pred_depth: int = 2,
+        use_mamba: bool = False,
+        dino_hidden: int = 512,
+        dino_out: int = 256,
         symbolic_train_cap: float = 0.5,
         symbolic_infer_cap: float = 1.0,
-        # Legacy compat: these are silently ignored if present
+        # Legacy compat: silently ignored
+        pred_depth: int | None = None,
         reasoner_max_steps: int | None = None,
     ) -> None:
         super().__init__()
-        self.encoder = IJepaEncoder2DRoPE(num_colors=num_colors + 1, dim=dim, depth=depth, heads=heads)
+        self.encoder = IJepaEncoder2DRoPE(
+            num_colors=num_colors + 1, dim=dim, depth=depth, heads=heads, use_mamba=use_mamba,
+        )
 
-        # EMA target encoder for proper I-JEPA (no gradients)
+        # DINO: EMA target encoder + projection heads
         self.target_encoder = copy.deepcopy(self.encoder)
         for p in self.target_encoder.parameters():
             p.requires_grad = False
-
-        # I-JEPA predictor (lightweight)
-        self.ijepa_predictor = IJepaPredictor(dim=dim, depth=pred_depth, heads=heads)
+        self.student_head = DINOHead(dim=dim, hidden_dim=dino_hidden, out_dim=dino_out)
+        self.teacher_head = copy.deepcopy(self.student_head)
+        for p in self.teacher_head.parameters():
+            p.requires_grad = False
+        self.register_buffer("dino_center", torch.zeros(1, dino_out))
 
         self.rule = CrossAttentionRuleExtractor(dim=dim, heads=heads)
+
+        # Router kept for novelty/uncertainty metrics + structure adaptation
         self.router = NoveltyRouter(dim=dim)
+
         self.reasoner = TrmHrmReasoner(
             dim=dim,
             depth=reasoner_depth,
@@ -66,15 +77,21 @@ class UnifiedArcModel(nn.Module):
             heads=heads,
         )
         self.decoder = IterativeRefinementDecoder(dim=dim, num_colors=num_colors, refine_steps=decoder_refine_steps)
+
+        # Auxiliary direct readout (shortcut gradient path for encoder)
+        self.aux_readout = nn.Linear(dim, num_colors)
+
         self.num_colors = num_colors
         self.symbolic_train_cap = symbolic_train_cap
         self.symbolic_infer_cap = symbolic_infer_cap
 
     @torch.no_grad()
-    def update_target_encoder(self, ema_decay: float = 0.996) -> None:
-        """EMA update of target encoder from online encoder."""
-        for p_online, p_target in zip(self.encoder.parameters(), self.target_encoder.parameters()):
-            p_target.data.mul_(ema_decay).add_((1.0 - ema_decay) * p_online.data)
+    def update_target_ema(self, ema_decay: float = 0.996) -> None:
+        """EMA update of target encoder + teacher head."""
+        for p_s, p_t in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+            p_t.data.mul_(ema_decay).add_((1.0 - ema_decay) * p_s.data)
+        for p_s, p_t in zip(self.student_head.parameters(), self.teacher_head.parameters()):
+            p_t.data.mul_(ema_decay).add_((1.0 - ema_decay) * p_s.data)
 
     @torch.no_grad()
     def adapt_structure(
@@ -102,28 +119,30 @@ class UnifiedArcModel(nn.Module):
         )
 
     def encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
-        """grid: [H, W] -> latent: [1, H*W, D]"""
         return self.encoder(grid.unsqueeze(0))
 
-    def compute_ijepa_loss(self, grid: torch.Tensor, mask_ratio: float = 0.4) -> torch.Tensor:
-        """Proper I-JEPA: predict target encoder latents from context encoder + predictor."""
-        grid_batch = grid.unsqueeze(0)  # [1, H, W]
-        b, h, w = grid_batch.shape
-        t = h * w
+    def compute_dino_loss(self, grid: torch.Tensor, center_momentum: float = 0.9) -> torch.Tensor:
+        """DINO self-distillation loss on the test input grid."""
+        grid_batch = grid.unsqueeze(0)
 
         with torch.no_grad():
-            target_latent = self.target_encoder(grid_batch)
-            target_latent = F.layer_norm(target_latent, (target_latent.shape[-1],))
+            teacher_latent = self.target_encoder(grid_batch)
+            teacher_pooled = teacher_latent.mean(dim=1)
+            teacher_proj = self.teacher_head(teacher_pooled)
 
-        context_latent = self.encoder(grid_batch)
+        student_latent = self.encoder(grid_batch)
+        student_pooled = student_latent.mean(dim=1)
+        student_proj = self.student_head(student_pooled)
 
-        num_target = max(1, int(t * mask_ratio))
-        target_indices = torch.randperm(t, device=grid.device)[:num_target]
+        loss = dino_loss(student_proj, teacher_proj, self.dino_center)
 
-        pred = self.ijepa_predictor(context_latent, target_indices, h, w)
-        target = target_latent[:, target_indices]
+        with torch.no_grad():
+            self.dino_center = (
+                self.dino_center * center_momentum
+                + teacher_proj.mean(dim=0, keepdim=True) * (1.0 - center_momentum)
+            )
 
-        return F.smooth_l1_loss(pred, target)
+        return loss
 
     def forward(
         self,
@@ -140,29 +159,30 @@ class UnifiedArcModel(nn.Module):
 
         test_latent = self.encode_grid(test_input)
 
-        # I-JEPA loss: computed on test input only (efficient)
+        # DINO loss (training only)
         if self.training:
-            ijepa_loss = self.compute_ijepa_loss(test_input)
+            d_loss = self.compute_dino_loss(test_input)
         else:
-            ijepa_loss = torch.zeros((), device=test_input.device)
+            d_loss = torch.zeros((), device=test_input.device)
 
         rule_out = self.rule(
             test_latent=test_latent,
             train_input_latents=train_in_latents,
             train_output_latents=train_out_latents,
         )
+
+        # Router: runs for metrics/structure adaptation, doesn't control compute
         router_out = self.router(rule_out.test_conditioned_latent)
 
         h, w = test_input.shape
-        reasoner_out = self.reasoner(
-            rule_out.test_conditioned_latent,
-            route_control=router_out.route_control,
-            h=h,
-            w=w,
-        )
-        decode_out = self.decoder(reasoner_out.latent, route_control=router_out.route_control)
+        reasoner_out = self.reasoner(rule_out.test_conditioned_latent, h=h, w=w)
+        decode_out = self.decoder(reasoner_out.latent)
 
         neural_logits = decode_out.logits.reshape(1, h, w, -1).permute(0, 3, 1, 2)
+
+        # Auxiliary direct readout (shortcut gradient path)
+        aux_logits_raw = self.aux_readout(rule_out.test_conditioned_latent)
+        aux_logits = aux_logits_raw.reshape(1, h, w, -1).permute(0, 3, 1, 2)
 
         sym = fit_symbolic_rule(train_inputs=train_inputs, train_outputs=train_outputs, test_input=test_input)
         sym_one_hot = torch.nn.functional.one_hot(sym.grid.clamp(0, self.num_colors - 1), num_classes=self.num_colors).float()
@@ -174,7 +194,8 @@ class UnifiedArcModel(nn.Module):
 
         return UnifiedForwardOutput(
             test_logits=test_logits,
-            ijepa_loss=ijepa_loss,
+            aux_logits=aux_logits,
+            dino_loss=d_loss,
             router=router_out,
             reasoner=reasoner_out,
             decoder=decode_out,

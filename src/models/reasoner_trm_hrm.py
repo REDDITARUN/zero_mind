@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
 import torch
 from torch import nn
@@ -12,7 +11,6 @@ from src.models.ijepa_rope import RopeAttentionBlock
 @dataclass
 class ReasonerOutput:
     latent: torch.Tensor
-    q_logits: torch.Tensor
     steps_used: int
     active_experts: int
 
@@ -44,15 +42,11 @@ class ReasoningModule(nn.Module):
 class TrmHrmReasoner(nn.Module):
     """TRM-inspired iterative reasoner with H/L hierarchy.
 
-    Architecture follows the TRM reference: a shared ReasoningModule is used
-    for both L-level (detail) and H-level (abstract) processing.  The nested
-    H/L cycle with input re-injection and 1-step gradient trick matches the
-    reference design.
-
-    Our additions beyond the reference:
-    - Dynamic expert growth/pruning for adaptive capacity
-    - Q-head for self-assessment of correctness
-    - Route-control modulation of effective H-cycles
+    Simplified vs. previous version:
+    - No Q-halt (removed RL)
+    - No route_control modulation (fixed iterations)
+    - Full gradients through all iterations (no 1-step trick during early training)
+    - Dynamic expert growth/pruning preserved
     """
 
     def __init__(
@@ -73,17 +67,11 @@ class TrmHrmReasoner(nn.Module):
         self.prune_cooldown_remaining = 0
         self.register_buffer("expert_utility_ema", torch.zeros(max_experts))
 
-        # TRM-style: shared reasoning module for both L and H levels
         self.reasoning = ReasoningModule(dim=dim, depth=depth, heads=heads)
 
-        # Learned initial states (broadcast to [B, T, D])
         self.h_init = nn.Parameter(torch.randn(dim) * 0.02)
         self.l_init = nn.Parameter(torch.randn(dim) * 0.02)
 
-        # Q-head: self-assessment -- predicts whether current output is correct
-        self.q_head = nn.Linear(dim, 1)
-
-        # Dynamic expert modules (our innovation beyond references)
         self.experts = nn.ModuleList(
             [
                 nn.Sequential(
@@ -96,51 +84,27 @@ class TrmHrmReasoner(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor, route_control: torch.Tensor, h: int, w: int) -> ReasonerOutput:
-        """
-        x: [B, T, D] -- input embeddings (from cross-attention rule extractor)
-        route_control: [B, 2] -- router alpha_sft/alpha_rl
-        h, w: spatial dims of the test grid
-        """
+    def forward(self, x: torch.Tensor, h: int, w: int) -> ReasonerOutput:
         b, t, d = x.shape
 
         z_H = self.h_init.view(1, 1, d).expand(b, t, d)
         z_L = self.l_init.view(1, 1, d).expand(b, t, d)
 
-        rl_strength = route_control[:, 1].mean().item()
-        effective_h = max(2, int(self.h_cycles * (0.5 + 0.5 * rl_strength)))
+        for _h_step in range(self.h_cycles):
+            for _l_step in range(self.l_cycles):
+                z_L = self.reasoning(z_L, z_H + x, h, w)
+            z_H = self.reasoning(z_H, z_L, h, w)
 
-        # 1-step gradient trick (from HRM/TRM reference):
-        # All iterations except the final H-cycle run without gradients.
-        # This is much more memory-efficient and matches the reference design.
-        if effective_h > 1:
-            with torch.no_grad():
-                for _h_step in range(effective_h - 1):
-                    for _l_step in range(self.l_cycles):
-                        z_L = self.reasoning(z_L, z_H + x, h, w)
-                    z_H = self.reasoning(z_H, z_L, h, w)
-
-        # Final H-cycle WITH gradients
-        for _l_step in range(self.l_cycles):
-            z_L = self.reasoning(z_L, z_H + x, h, w)
-        z_H = self.reasoning(z_H, z_L, h, w)
-
-        # Expert enrichment (our innovation)
         if self.active_experts > 0:
             exp_out = torch.zeros_like(z_H)
             for i in range(self.active_experts):
                 exp_out = exp_out + self.experts[i](z_H)
             z_H = z_H + exp_out / float(self.active_experts)
 
-        # Q-head: predict whether the model will get this task correct
-        pooled = z_H.mean(dim=1)
-        q_logits = self.q_head(pooled).squeeze(-1)
-
-        total_steps = effective_h * self.l_cycles + self.l_cycles
+        total_steps = self.h_cycles * self.l_cycles + self.h_cycles
 
         return ReasonerOutput(
             latent=z_H,
-            q_logits=q_logits,
             steps_used=total_steps,
             active_experts=self.active_experts,
         )

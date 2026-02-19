@@ -27,6 +27,11 @@ def main() -> None:
 
     device = torch.device(train_cfg.device)
     model = UnifiedArcModel(**model_cfg)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {total_params:,} params ({trainable:,} trainable)")
+
     if args.load_checkpoint:
         payload = torch.load(args.load_checkpoint, map_location=device)
         model.load_state_dict(payload["state_dict"])
@@ -35,33 +40,15 @@ def main() -> None:
 
     print(
         {
-            "training_methodology": "shared_forward_mixed_objective",
-            "auto_switch": "router_controls_effective_sft_rl_weights",
-            "sft_warmup_steps": train_cfg.sft_warmup_steps,
-            "min_sft_weight": train_cfg.min_sft_weight,
-            "sft_refresh_interval": train_cfg.sft_refresh_interval,
-            "sft_refresh_span": train_cfg.sft_refresh_span,
-            "sft_refresh_min": train_cfg.sft_refresh_min,
-            "routing_explore_steps": train_cfg.routing_explore_steps,
-            "routing_explore_floor": train_cfg.routing_explore_floor,
-            "routing_entropy_bonus": train_cfg.routing_entropy_bonus,
+            "methodology": "SFT + DINO + aux (no RL)",
+            "lr": train_cfg.lr,
+            "lr_warmup_steps": train_cfg.lr_warmup_steps,
+            "grad_accum_steps": train_cfg.grad_accum_steps,
+            "w_aux": train_cfg.w_aux,
+            "w_dino": train_cfg.w_dino,
             "adapt_structure": train_cfg.adapt_structure,
-            "adapt_interval": train_cfg.adapt_interval,
-            "grow_threshold": train_cfg.grow_threshold,
-            "prune_threshold": train_cfg.prune_threshold,
-            "hard_expert_cap": train_cfg.hard_expert_cap,
-            "target_expert_cap": train_cfg.target_expert_cap,
-            "prune_cooldown_steps": train_cfg.prune_cooldown_steps,
-            "growth_force_until_step": train_cfg.growth_force_until_step,
-            "growth_force_interval": train_cfg.growth_force_interval,
-            "growth_force_exact_threshold": train_cfg.growth_force_exact_threshold,
-            "expert_budget_coeff": train_cfg.expert_budget_coeff,
-            "compute_penalty_coeff": train_cfg.compute_penalty_coeff,
-            "reward_pixel_coeff": train_cfg.reward_pixel_coeff,
-            "reward_exact_coeff": train_cfg.reward_exact_coeff,
-            "metrics_jsonl_path": train_cfg.metrics_jsonl_path,
-            "stream_source": stream_cfg.source,
             "max_steps": train_cfg.steps,
+            "stream_source": stream_cfg.source,
         }
     )
 

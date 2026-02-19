@@ -13,11 +13,11 @@ train:
   replay_ratio: 0.0
   replay_capacity: 1
   log_every: 1
-  sft_warmup_steps: 1
-  min_sft_weight: 0.3
-  routing_explore_steps: 1
-  routing_explore_floor: 0.15
-  routing_entropy_bonus: 0.0
+  lr_warmup_steps: 1
+  grad_accum_steps: 1
+  ema_decay: 0.996
+  w_aux: 0.0
+  w_dino: 0.0
   adapt_structure: false
   adapt_interval: 1
   grow_threshold: 0.6

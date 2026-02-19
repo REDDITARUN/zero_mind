@@ -119,8 +119,8 @@ def evaluate_once(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_config", type=str, default="configs/serious_arc_v2.yaml")
-    parser.add_argument("--eval_config", type=str, default="configs/arc_test_eval.yaml")
+    parser.add_argument("--train_config", type=str, default="configs/colab_cuda.yaml")
+    parser.add_argument("--eval_config", type=str, default="configs/colab_eval.yaml")
     parser.add_argument("--eval_every", type=int, default=2000)
     parser.add_argument("--eval_steps", type=int, default=200)
     parser.add_argument("--eval_pass_k", type=int, default=3)
@@ -142,6 +142,13 @@ def main() -> None:
         print({"resume_from": args.load_checkpoint})
     trainer = UnifiedTrainer(model=model, cfg=train_cfg)
     train_stream = make_episode_stream(train_stream_cfg, device=device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {total_params:,} params ({trainable:,} trainable)")
+    print(f"LR warmup: {train_cfg.lr_warmup_steps} steps, grad_accum: {train_cfg.grad_accum_steps}")
+    print(f"Loss: SFT + {train_cfg.w_aux}*aux + {train_cfg.w_dino}*DINO + {train_cfg.w_consistency}*consistency")
+    print(f"Training {train_cfg.steps} steps on {train_cfg.device}")
 
     try:
         from tqdm import tqdm
@@ -168,18 +175,20 @@ def main() -> None:
                 pbar.set_postfix(
                     {
                         "loss": f"{m['total']:.3f}",
+                        "sft": f"{m['sft']:.3f}",
+                        "px": f"{m['pixel_acc']:.3f}",
                         "exact": f"{m['exact']:.3f}",
                         "solved%": f"{m['cumulative_solved_pct']:.2f}",
-                        "xperts": f"{m['active_experts']:.1f}",
+                        "xperts": f"{m['active_experts']:.0f}",
                     }
                 )
 
         if step % train_cfg.log_every == 0:
             print(
-                f"step={step} loss={m['total']:.4f} exact={m['exact']:.3f} "
-                f"router_sft={m['alpha_sft']:.3f} router_rl={m['alpha_rl']:.3f} "
-                f"eff_sft={m['eff_sft_weight']:.3f} eff_rl={m['eff_rl_weight']:.3f} "
-                f"solved%={m['cumulative_solved_pct']:.2f} xperts={m['active_experts']:.2f}"
+                f"step={step} loss={m['total']:.4f} sft={m['sft']:.3f} "
+                f"aux={m.get('aux', 0):.3f} dino={m['dino']:.3f} "
+                f"px_acc={m['pixel_acc']:.3f} exact={m['exact']:.3f} "
+                f"solved%={m['cumulative_solved_pct']:.2f} xperts={m['active_experts']:.0f} lr={m['lr']:.2e}"
             )
 
         if step % max(1, args.eval_every) == 0:
