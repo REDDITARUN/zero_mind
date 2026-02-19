@@ -4,9 +4,84 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
-from src.models.ijepa_rope import RopeAttentionBlock
+from src.models.ijepa_rope import apply_2d_rope
 
+
+# ---------------------------------------------------------------------------
+# HRM-faithful building blocks
+# ---------------------------------------------------------------------------
+
+def _rms_norm(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps).to(x.dtype)
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim: int, expansion: float = 4.0) -> None:
+        super().__init__()
+        inter = ((int(round(expansion * dim * 2 / 3)) + 63) // 64) * 64
+        self.gate_up = nn.Linear(dim, inter * 2, bias=False)
+        self.down = nn.Linear(inter, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up(x).chunk(2, dim=-1)
+        return self.down(F.silu(gate) * up)
+
+
+class HrmBlock(nn.Module):
+    """HRM-style block: post-norm RMS + SwiGLU + 2D RoPE attention.
+
+    Matches the reference HierarchicalReasoningModel_ACTV1Block:
+      x = rms_norm(x + self_attn(x))
+      x = rms_norm(x + mlp(x))
+    but using 2D RoPE (better for grids) instead of 1D.
+    """
+
+    def __init__(self, dim: int, heads: int, expansion: float = 4.0, rms_eps: float = 1e-5) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.rms_eps = rms_eps
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.mlp = SwiGLU(dim, expansion)
+
+    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        b, t, d = x.shape
+        qkv = self.qkv(x).view(b, t, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k = apply_2d_rope(q, k, h=h, w=w)
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).reshape(b, t, d)
+
+        x = _rms_norm(x + self.proj(attn), self.rms_eps)
+        x = _rms_norm(x + self.mlp(x), self.rms_eps)
+        return x
+
+
+class HrmLevel(nn.Module):
+    """One level (H or L) of the HRM hierarchy.
+
+    Matches HierarchicalReasoningModel_ACTV1ReasoningModule:
+      hidden = hidden + injection, then through layers.
+    """
+
+    def __init__(self, dim: int, num_layers: int, heads: int) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([HrmBlock(dim=dim, heads=heads) for _ in range(num_layers)])
+
+    def forward(self, hidden: torch.Tensor, injection: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        hidden = hidden + injection
+        for block in self.blocks:
+            hidden = block(hidden, h=h, w=w)
+        return hidden
+
+
+# ---------------------------------------------------------------------------
+# Main reasoner
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ReasonerOutput:
@@ -15,51 +90,39 @@ class ReasonerOutput:
     active_experts: int
 
 
-class ReasoningModule(nn.Module):
-    """TRM/HRM-style reasoning module with input injection.
-
-    Each call: hidden = hidden + injection, then through transformer blocks.
-    Uses 2D RoPE so the reasoner is spatially aware.
-    """
-
-    def __init__(self, dim: int = 256, depth: int = 2, heads: int = 8) -> None:
-        super().__init__()
-        self.blocks = nn.ModuleList([RopeAttentionBlock(dim=dim, heads=heads) for _ in range(depth)])
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        input_injection: torch.Tensor,
-        h: int,
-        w: int,
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + input_injection
-        for block in self.blocks:
-            hidden_states = block(hidden_states, h=h, w=w)
-        return hidden_states
-
-
 class TrmHrmReasoner(nn.Module):
-    """TRM-inspired iterative reasoner with H/L hierarchy.
+    """Hierarchical Reasoning Model — faithful to reference HRM.
 
-    Simplified vs. previous version:
-    - No Q-halt (removed RL)
-    - No route_control modulation (fixed iterations)
-    - Full gradients through all iterations (no 1-step trick during early training)
-    - Dynamic expert growth/pruning preserved
+    Key design choices matching the reference (hrm_act_v1.py):
+      1. Separate H_level and L_level with independent parameters
+      2. 1-step gradient trick: all iterations except the final L+H run
+         in torch.no_grad(), only the last step backpropagates
+      3. Post-norm RMS + SwiGLU blocks (matching reference block design)
+      4. Fixed initial states (buffers, not parameters)
+
+    Our improvements over reference:
+      - 2D RoPE instead of 1D (better for ARC grids)
+      - Dynamic expert growth/pruning on top of final H state
     """
 
     def __init__(
         self,
         dim: int = 256,
-        depth: int = 2,
+        h_layers: int = 3,
+        l_layers: int = 3,
         h_cycles: int = 3,
         l_cycles: int = 2,
         heads: int = 8,
         max_experts: int = 8,
         init_active_experts: int = 2,
+        # Legacy compat — accepted, used as fallback
+        depth: int | None = None,
     ) -> None:
         super().__init__()
+        if depth is not None:
+            h_layers = depth
+            l_layers = depth
+
         self.h_cycles = h_cycles
         self.l_cycles = l_cycles
         self.max_experts = max_experts
@@ -67,10 +130,11 @@ class TrmHrmReasoner(nn.Module):
         self.prune_cooldown_remaining = 0
         self.register_buffer("expert_utility_ema", torch.zeros(max_experts))
 
-        self.reasoning = ReasoningModule(dim=dim, depth=depth, heads=heads)
+        self.H_level = HrmLevel(dim=dim, num_layers=h_layers, heads=heads)
+        self.L_level = HrmLevel(dim=dim, num_layers=l_layers, heads=heads)
 
-        self.h_init = nn.Parameter(torch.randn(dim) * 0.02)
-        self.l_init = nn.Parameter(torch.randn(dim) * 0.02)
+        self.register_buffer("H_init", torch.randn(dim) * 0.02)
+        self.register_buffer("L_init", torch.randn(dim) * 0.02)
 
         self.experts = nn.ModuleList(
             [
@@ -87,13 +151,27 @@ class TrmHrmReasoner(nn.Module):
     def forward(self, x: torch.Tensor, h: int, w: int) -> ReasonerOutput:
         b, t, d = x.shape
 
-        z_H = self.h_init.view(1, 1, d).expand(b, t, d)
-        z_L = self.l_init.view(1, 1, d).expand(b, t, d)
+        z_H = self.H_init.view(1, 1, d).expand(b, t, d)
+        z_L = self.L_init.view(1, 1, d).expand(b, t, d)
 
-        for _h_step in range(self.h_cycles):
-            for _l_step in range(self.l_cycles):
-                z_L = self.reasoning(z_L, z_H + x, h, w)
-            z_H = self.reasoning(z_H, z_L, h, w)
+        last_h = self.h_cycles - 1
+        last_l = self.l_cycles - 1
+
+        # 1-step gradient trick (matching reference HRM):
+        # All iterations except the final L+H step run without grad.
+        # Only the last L_level + H_level call records activations for backprop.
+        with torch.no_grad():
+            for h_step in range(self.h_cycles):
+                for l_step in range(self.l_cycles):
+                    if not (h_step == last_h and l_step == last_l):
+                        z_L = self.L_level(z_L, z_H + x, h, w)
+                if h_step != last_h:
+                    z_H = self.H_level(z_H, z_L, h, w)
+
+        # Final iteration — this is the only step that gets gradients.
+        # Gradients flow: loss → z_H → H_level → z_L → L_level → x → encoder
+        z_L = self.L_level(z_L, z_H + x, h, w)
+        z_H = self.H_level(z_H, z_L, h, w)
 
         if self.active_experts > 0:
             exp_out = torch.zeros_like(z_H)

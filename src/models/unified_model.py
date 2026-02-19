@@ -72,12 +72,14 @@ class UnifiedArcModel(nn.Module):
         dim: int = 256,
         depth: int = 8,
         heads: int = 8,
-        # Content reasoner (full power)
-        reasoner_depth: int = 3,
+        # Content reasoner — separate H and L levels (faithful HRM)
+        h_layers: int = 3,
+        l_layers: int = 3,
         h_cycles: int = 3,
         l_cycles: int = 2,
         # Shape reasoner (lightweight parallel loop)
-        shape_reasoner_depth: int = 1,
+        shape_h_layers: int = 1,
+        shape_l_layers: int = 1,
         shape_h_cycles: int = 1,
         shape_l_cycles: int = 1,
         # Content decoder
@@ -92,6 +94,8 @@ class UnifiedArcModel(nn.Module):
         dino_out: int = 0,
         pred_depth: int | None = None,
         reasoner_max_steps: int | None = None,
+        reasoner_depth: int | None = None,
+        shape_reasoner_depth: int | None = None,
     ) -> None:
         super().__init__()
         self.encoder = IJepaEncoder2DRoPE(
@@ -102,11 +106,15 @@ class UnifiedArcModel(nn.Module):
 
         self.router = NoveltyRouter(dim=dim)
 
+        _h = h_layers if reasoner_depth is None else reasoner_depth
+        _l = l_layers if reasoner_depth is None else reasoner_depth
         self.content_reasoner = TrmHrmReasoner(
-            dim=dim, depth=reasoner_depth, h_cycles=h_cycles, l_cycles=l_cycles, heads=heads,
+            dim=dim, h_layers=_h, l_layers=_l, h_cycles=h_cycles, l_cycles=l_cycles, heads=heads,
         )
+        _sh = shape_h_layers if shape_reasoner_depth is None else shape_reasoner_depth
+        _sl = shape_l_layers if shape_reasoner_depth is None else shape_reasoner_depth
         self.shape_reasoner = TrmHrmReasoner(
-            dim=dim, depth=shape_reasoner_depth,
+            dim=dim, h_layers=_sh, l_layers=_sl,
             h_cycles=shape_h_cycles, l_cycles=shape_l_cycles,
             heads=heads, max_experts=2, init_active_experts=1,
         )

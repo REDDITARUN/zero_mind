@@ -61,7 +61,7 @@ import torch
 from src.models.unified_model import UnifiedArcModel
 from src.training.losses import compute_unified_loss
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-m = UnifiedArcModel(num_colors=10, dim=64, depth=2, heads=4, reasoner_depth=1, h_cycles=2, l_cycles=2, shape_reasoner_depth=1, shape_h_cycles=1, shape_l_cycles=1, decoder_refine_steps=2)
+m = UnifiedArcModel(num_colors=10, dim=64, depth=2, heads=4, h_layers=1, l_layers=1, h_cycles=2, l_cycles=2, shape_h_layers=1, shape_l_layers=1, shape_h_cycles=1, shape_l_cycles=1, decoder_refine_steps=2)
 m = m.to(device)
 ti = [torch.randint(0,10,(5,5),device=device)]
 to = [torch.randint(0,10,(5,5),device=device)]
