@@ -80,8 +80,8 @@ def compute_unified_loss(
         + w_consistency * l_consistency
     )
 
-    if loss_clamp > 0:
-        total = torch.clamp(total, max=loss_clamp)
+    if loss_clamp > 0 and total > loss_clamp:
+        total = loss_clamp + torch.log1p(total - loss_clamp)
 
     return LossBreakdown(
         total=total,

@@ -91,8 +91,12 @@ class UnifiedTrainer:
         self._amp_dtype = torch.bfloat16
 
         if cfg.device.startswith("cuda"):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
+            except (AttributeError, TypeError):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
             print("CUDA optimizations: TF32 + cudnn.benchmark enabled")
 

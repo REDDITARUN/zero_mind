@@ -29,10 +29,10 @@ train:
   compile_model: false
   w_draft: 0.5
   w_aux: 0.3
-  w_focus: 1.0
+  w_focus: 0.15
   w_consistency: 0.02
   label_smoothing: 0.05
-  loss_clamp: 4.0
+  loss_clamp: 5.0
   adapt_structure: true
   adapt_interval: 1
   grow_threshold: 0.34
