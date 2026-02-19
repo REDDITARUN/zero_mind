@@ -40,12 +40,11 @@ def main() -> None:
 
     print(
         {
-            "methodology": "HRM + Draft-Correct Decoder (System1/2) + BF16",
+            "methodology": "HRM + Iterative MLP Decoder + TTT @ inference",
             "lr": train_cfg.lr,
             "lr_warmup_steps": train_cfg.lr_warmup_steps,
             "grad_accum_steps": train_cfg.grad_accum_steps,
             "use_amp": train_cfg.use_amp,
-            "w_draft": train_cfg.w_draft,
             "w_aux": train_cfg.w_aux,
             "label_smoothing": train_cfg.label_smoothing,
             "adapt_structure": train_cfg.adapt_structure,

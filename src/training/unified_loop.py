@@ -9,6 +9,7 @@ from pathlib import Path
 import random
 
 import torch
+import torch.nn.functional as F
 
 from src.data.arc_simulator import ArcEpisode
 from src.models.unified_model import UnifiedArcModel
@@ -37,12 +38,10 @@ class TrainConfig:
     use_amp: bool = False
     compile_model: bool = False
 
-    w_draft: float = 0.5
     w_aux: float = 0.3
-    w_focus: float = 1.0
     w_consistency: float = 0.02
     label_smoothing: float = 0.05
-    loss_clamp: float = 4.0
+    loss_clamp: float = 5.0
 
     adapt_structure: bool = True
     adapt_interval: int = 1
@@ -62,6 +61,8 @@ class TrainConfig:
     ema_decay: float = 0.996
     w_dino: float = 0.0
     w_shape: float = 0.0
+    w_draft: float = 0.0
+    w_focus: float = 0.0
     sft_warmup_steps: int = 0
     min_sft_weight: float = 0.0
     sft_refresh_interval: int = 0
@@ -148,9 +149,7 @@ class UnifiedTrainer:
                 step=step,
                 total_steps=self.cfg.steps,
                 lr_warmup_steps=self.cfg.lr_warmup_steps,
-                w_draft=self.cfg.w_draft,
                 w_aux=self.cfg.w_aux,
-                w_focus=self.cfg.w_focus,
                 w_consistency=self.cfg.w_consistency,
                 label_smoothing=self.cfg.label_smoothing,
                 loss_clamp=self.cfg.loss_clamp,
@@ -201,21 +200,18 @@ class UnifiedTrainer:
         if loss.exact_match.item() < 1.0:
             self.failure_replay.append(episode)
 
-        draft_acc = float(
-            (out.draft_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()
+        pixel_acc = float(
+            (out.test_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()
         )
 
         return {
             "total": float(loss.total.detach().cpu()),
-            "correct": float(loss.l_correct.detach().cpu()),
-            "draft": float(loss.l_draft.detach().cpu()),
+            "content": float(loss.l_content.detach().cpu()),
             "aux": float(loss.l_aux.detach().cpu()),
-            "focus": float(loss.l_focus.detach().cpu()),
             "consistency": float(loss.l_consistency.detach().cpu()),
             "reward": float(loss.reward.cpu()),
             "exact": float(loss.exact_match.cpu()),
-            "pixel_acc": float((out.test_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()),
-            "draft_acc": draft_acc,
+            "pixel_acc": pixel_acc,
             "lr": current_lr,
             "alpha_sft": float(out.router.alpha_sft.mean().detach().cpu()),
             "alpha_rl": float(out.router.alpha_rl.mean().detach().cpu()),
@@ -232,8 +228,8 @@ class UnifiedTrainer:
         if not self.recent:
             return {}
         keys = [
-            "total", "correct", "draft", "aux", "exact", "pixel_acc",
-            "draft_acc", "novelty", "uncertainty", "active_experts",
+            "total", "content", "aux", "exact", "pixel_acc",
+            "novelty", "uncertainty", "active_experts",
             "symbolic_confidence",
         ]
         out: Dict[str, float] = {}
@@ -281,8 +277,6 @@ class UnifiedTrainer:
                         {
                             "loss": f"{avg.get('total', m['total']):.3f}",
                             "px": f"{avg.get('pixel_acc', m['pixel_acc']):.3f}",
-                            "drft": f"{avg.get('draft_acc', m['draft_acc']):.3f}",
-                            "fix": f"{avg.get('pixel_acc', m['pixel_acc']) - avg.get('draft_acc', m['draft_acc']):+.3f}",
                             "exact": f"{avg.get('exact', m['exact']):.3f}",
                             "solved%": f"{m['cumulative_solved_pct']:.1f}",
                             "xprt": f"{avg.get('active_experts', m['active_experts']):.0f}",
@@ -291,15 +285,11 @@ class UnifiedTrainer:
                     )
             if step % self.cfg.log_every == 0:
                 avg = self._summarize_recent()
-                fix_delta = avg.get('pixel_acc', m['pixel_acc']) - avg.get('draft_acc', m['draft_acc'])
                 print(
                     f"step={step} loss={avg.get('total', m['total']):.4f} "
-                    f"correct={avg.get('correct', m['correct']):.3f} "
-                    f"draft={avg.get('draft', m['draft']):.3f} "
-                    f"focus={avg.get('focus', m.get('focus', 0)):.3f} "
+                    f"ce={avg.get('content', m['content']):.3f} "
+                    f"aux={avg.get('aux', m['aux']):.3f} "
                     f"px={avg.get('pixel_acc', m['pixel_acc']):.3f} "
-                    f"drft={avg.get('draft_acc', m['draft_acc']):.3f} "
-                    f"fix={fix_delta:+.3f} "
                     f"exact={avg.get('exact', m['exact']):.3f} "
                     f"solved%={m['cumulative_solved_pct']:.2f} "
                     f"xprt={avg.get('active_experts', m['active_experts']):.0f} "
@@ -321,3 +311,51 @@ def run_inference(model: UnifiedArcModel, episode: ArcEpisode) -> torch.Tensor:
         test_input=episode.test_input,
     )
     return out.test_logits.argmax(dim=1).squeeze(0)
+
+
+def run_inference_ttt(
+    model: UnifiedArcModel,
+    episode: ArcEpisode,
+    ttt_steps: int = 5,
+    ttt_lr: float = 1e-4,
+) -> torch.Tensor:
+    """Test-Time Training: fine-tune on the task's own examples before predicting.
+
+    Uses leave-one-out on training pairs — predict each training output
+    using the remaining pairs as context, backprop the error, then predict
+    the test output with the adapted weights. Restores original weights after.
+    """
+    model.eval()
+
+    if ttt_steps <= 0 or len(episode.train_inputs) < 2:
+        return run_inference(model, episode)
+
+    saved_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    ttt_params = list(model.decoder.parameters()) + list(model.content_reasoner.parameters())
+    optim = torch.optim.Adam(ttt_params, lr=ttt_lr)
+
+    model.train()
+    for _ in range(ttt_steps):
+        total_loss = torch.tensor(0.0, device=episode.test_input.device)
+        for i in range(len(episode.train_inputs)):
+            other_in = episode.train_inputs[:i] + episode.train_inputs[i + 1 :]
+            other_out = episode.train_outputs[:i] + episode.train_outputs[i + 1 :]
+            out = model(other_in, other_out, episode.train_inputs[i])
+            target = episode.train_outputs[i].unsqueeze(0)
+            total_loss = total_loss + F.cross_entropy(out.test_logits, target)
+        total_loss.backward()
+        optim.step()
+        optim.zero_grad(set_to_none=True)
+
+    model.eval()
+    with torch.no_grad():
+        out = model(
+            train_inputs=episode.train_inputs,
+            train_outputs=episode.train_outputs,
+            test_input=episode.test_input,
+        )
+    pred = out.test_logits.argmax(dim=1).squeeze(0)
+
+    model.load_state_dict(saved_state)
+    return pred

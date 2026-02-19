@@ -11,14 +11,13 @@ from src.models.ijepa_rope import IJepaEncoder2DRoPE
 from src.models.cross_attention_rule import CrossAttentionRuleExtractor
 from src.models.router import NoveltyRouter, RouterOutput
 from src.models.reasoner_trm_hrm import TrmHrmReasoner, ReasonerOutput
-from src.models.decoder_refine import DraftCorrectDecoder, DecodeOutput
+from src.models.decoder_refine import IterativeDecoder, DecodeOutput
 from src.models.symbolic_primitives import fit_symbolic_rule
 
 
 @dataclass
 class UnifiedForwardOutput:
     test_logits: torch.Tensor
-    draft_logits: torch.Tensor
     aux_logits: torch.Tensor
     router: RouterOutput
     reasoner: ReasonerOutput
@@ -29,23 +28,17 @@ class UnifiedForwardOutput:
 
 
 class UnifiedArcModel(nn.Module):
-    """v4: HRM + Draft-Correct Decoder (System 1 + System 2).
+    """v5: Stripped-back HRM + simple MLP decoder + test-time training.
 
     Architecture:
       Encoder (RoPE Attention) → Cross-Attention Rule Extractor →
         Content Reasoner (HRM: H/L cycles with 1-step grad trick) →
-        Draft-Correct Decoder:
-          Stage 1 — Draft: fast MLP refinement (strong gradients)
-          Stage 2 — Correct: re-inject draft, self-attend to fix errors
+        Iterative MLP Decoder (shared weights, no attention)
       + Auxiliary direct readout (gradient shortcut for encoder)
       + Symbolic blend at inference
 
-    Key changes from v3:
-      - Removed shape reasoner/predictor (wasted compute for same-shape)
-      - DraftCorrectDecoder replaces CrossAttn ContentDecoder
-        (direct token refinement >> generating from scratch canvas)
-      - Two learning signals: draft loss + corrector loss
-      - Simpler, faster, stronger gradients
+    Philosophy: simple architecture, creative inference.
+    Test-time training (TTT) adapts the model per-task at inference.
     """
 
     def __init__(
@@ -58,12 +51,11 @@ class UnifiedArcModel(nn.Module):
         l_layers: int = 3,
         h_cycles: int = 3,
         l_cycles: int = 2,
-        draft_steps: int = 3,
-        correct_steps: int = 3,
+        refine_steps: int = 6,
         use_mamba: bool = False,
         symbolic_train_cap: float = 0.0,
         symbolic_infer_cap: float = 1.0,
-        # Legacy compat — silently ignored
+        # Legacy compat
         dino_hidden: int = 0,
         dino_out: int = 0,
         pred_depth: int | None = None,
@@ -75,14 +67,14 @@ class UnifiedArcModel(nn.Module):
         shape_h_cycles: int | None = None,
         shape_l_cycles: int | None = None,
         decoder_refine_steps: int | None = None,
+        draft_steps: int | None = None,
+        correct_steps: int | None = None,
     ) -> None:
         super().__init__()
         self.encoder = IJepaEncoder2DRoPE(
             num_colors=num_colors + 1, dim=dim, depth=depth, heads=heads, use_mamba=use_mamba,
         )
-
         self.rule = CrossAttentionRuleExtractor(dim=dim, heads=heads)
-
         self.router = NoveltyRouter(dim=dim)
 
         _h = h_layers if reasoner_depth is None else reasoner_depth
@@ -91,11 +83,12 @@ class UnifiedArcModel(nn.Module):
             dim=dim, h_layers=_h, l_layers=_l, h_cycles=h_cycles, l_cycles=l_cycles, heads=heads,
         )
 
-        _ds = draft_steps if decoder_refine_steps is None else max(1, decoder_refine_steps // 2)
-        _cs = correct_steps if decoder_refine_steps is None else max(1, decoder_refine_steps - _ds)
-        self.decoder = DraftCorrectDecoder(
-            dim=dim, num_colors=num_colors, draft_steps=_ds, correct_steps=_cs, heads=heads,
-        )
+        _rs = refine_steps
+        if decoder_refine_steps is not None:
+            _rs = decoder_refine_steps
+        elif draft_steps is not None and correct_steps is not None:
+            _rs = draft_steps + correct_steps
+        self.decoder = IterativeDecoder(dim=dim, num_colors=num_colors, refine_steps=_rs)
 
         self.aux_readout = nn.Linear(dim, num_colors)
 
@@ -104,29 +97,8 @@ class UnifiedArcModel(nn.Module):
         self.symbolic_infer_cap = symbolic_infer_cap
 
     @torch.no_grad()
-    def adapt_structure(
-        self,
-        reward: float,
-        novelty: float,
-        uncertainty: float,
-        hard_cap: int | None = None,
-        target_cap: int | None = None,
-        grow_threshold: float = 0.55,
-        prune_threshold: float = 0.15,
-        ema_momentum: float = 0.9,
-        prune_cooldown_steps: int = 0,
-    ) -> tuple[bool, bool]:
-        return self.content_reasoner.adapt_structure(
-            reward=reward,
-            novelty=novelty,
-            uncertainty=uncertainty,
-            hard_cap=hard_cap,
-            target_cap=target_cap,
-            grow_threshold=grow_threshold,
-            prune_threshold=prune_threshold,
-            ema_momentum=ema_momentum,
-            prune_cooldown_steps=prune_cooldown_steps,
-        )
+    def adapt_structure(self, **kwargs) -> tuple[bool, bool]:
+        return self.content_reasoner.adapt_structure(**kwargs)
 
     def encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         return self.encoder(grid.unsqueeze(0))
@@ -137,7 +109,6 @@ class UnifiedArcModel(nn.Module):
         train_outputs: List[torch.Tensor],
         test_input: torch.Tensor,
     ) -> tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-        """Batch-encode all grids in one GPU call when shapes match."""
         all_grids = train_inputs + train_outputs + [test_input]
         shapes = {g.shape for g in all_grids}
         if len(shapes) == 1:
@@ -174,13 +145,11 @@ class UnifiedArcModel(nn.Module):
         router_out = self.router(rule_out.test_conditioned_latent)
 
         h_in, w_in = test_input.shape
-
         content_out = self.content_reasoner(rule_out.test_conditioned_latent, h=h_in, w=w_in)
 
         decode_out = self.decoder(content_out.latent, h=h_in, w=w_in)
 
         neural_logits = decode_out.logits.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
-        draft_logits_2d = decode_out.draft_logits.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
 
         aux_logits_raw = self.aux_readout(rule_out.test_conditioned_latent)
         aux_logits = aux_logits_raw.reshape(1, h_in, w_in, -1).permute(0, 3, 1, 2)
@@ -195,7 +164,6 @@ class UnifiedArcModel(nn.Module):
 
         return UnifiedForwardOutput(
             test_logits=test_logits,
-            draft_logits=draft_logits_2d,
             aux_logits=aux_logits,
             router=router_out,
             reasoner=content_out,

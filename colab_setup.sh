@@ -61,7 +61,7 @@ import torch
 from src.models.unified_model import UnifiedArcModel
 from src.training.losses import compute_unified_loss
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-m = UnifiedArcModel(num_colors=10, dim=64, depth=2, heads=4, h_layers=1, l_layers=1, h_cycles=2, l_cycles=2, draft_steps=2, correct_steps=2)
+m = UnifiedArcModel(num_colors=10, dim=64, depth=2, heads=4, h_layers=1, l_layers=1, h_cycles=2, l_cycles=2, refine_steps=4)
 m = m.to(device)
 ti = [torch.randint(0,10,(5,5),device=device)]
 to = [torch.randint(0,10,(5,5),device=device)]
@@ -76,7 +76,7 @@ print(f'Smoke test PASSED on {device} | loss={loss.total.item():.3f}')
 
 echo ""
 echo "=== Setup complete! ==="
-echo "To train (v4 Draft+Correct with BF16):"
+echo "To train (v5 HRM + Iterative MLP Decoder + TTT):"
 echo "  python scripts/run_train_with_eval.py --train_config configs/colab_cuda.yaml --eval_config configs/colab_eval.yaml --eval_every 2000 --eval_steps 200 --eval_pass_k 3"
 echo ""
 echo "Or quick (no eval checkpoints):"

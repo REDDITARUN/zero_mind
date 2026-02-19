@@ -7,8 +7,7 @@ model:
   l_layers: 3
   h_cycles: 3
   l_cycles: 2
-  draft_steps: 3
-  correct_steps: 3
+  refine_steps: 6
   use_mamba: false
   symbolic_train_cap: 0.0
   symbolic_infer_cap: 1.0
@@ -27,9 +26,7 @@ train:
   grad_accum_steps: 4
   use_amp: true
   compile_model: false
-  w_draft: 0.5
   w_aux: 0.3
-  w_focus: 0.15
   w_consistency: 0.02
   label_smoothing: 0.05
   loss_clamp: 5.0
