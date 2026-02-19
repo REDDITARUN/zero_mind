@@ -40,12 +40,12 @@ def main() -> None:
 
     print(
         {
-            "methodology": "SFT + DINO + aux (no RL)",
+            "methodology": "Dual-HRM + CrossAttn Content Decoder + Shape Predictor",
             "lr": train_cfg.lr,
             "lr_warmup_steps": train_cfg.lr_warmup_steps,
             "grad_accum_steps": train_cfg.grad_accum_steps,
+            "w_shape": train_cfg.w_shape,
             "w_aux": train_cfg.w_aux,
-            "w_dino": train_cfg.w_dino,
             "adapt_structure": train_cfg.adapt_structure,
             "max_steps": train_cfg.steps,
             "stream_source": stream_cfg.source,

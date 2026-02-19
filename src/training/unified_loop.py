@@ -29,19 +29,14 @@ class TrainConfig:
     rolling_window: int = 50
     show_progress_bar: bool = True
 
-    # LR schedule
     lr_warmup_steps: int = 1000
     lr_min_ratio: float = 0.05
 
-    # Gradient accumulation
     grad_accum_steps: int = 4
 
-    # EMA for DINO target encoder
-    ema_decay: float = 0.996
-
     # Loss weights
+    w_shape: float = 0.3
     w_aux: float = 0.3
-    w_dino: float = 0.5
     w_consistency: float = 0.02
 
     # Structure adaptation
@@ -59,7 +54,9 @@ class TrainConfig:
     expert_budget_coeff: float = 0.25
     compute_penalty_coeff: float = 0.01
 
-    # Legacy compat (accepted, ignored by new loss)
+    # Legacy compat — accepted but ignored
+    ema_decay: float = 0.996
+    w_dino: float = 0.0
     sft_warmup_steps: int = 0
     min_sft_weight: float = 0.0
     sft_refresh_interval: int = 0
@@ -74,7 +71,6 @@ class TrainConfig:
 
 
 def _cosine_lr(step: int, warmup: int, total: int, min_ratio: float = 0.05) -> float:
-    """Warmup + cosine decay schedule. Returns multiplier in [min_ratio, 1.0]."""
     if step < warmup:
         return max(min_ratio, step / max(1, warmup))
     progress = (step - warmup) / max(1, total - warmup)
@@ -124,14 +120,13 @@ class UnifiedTrainer:
             step=step,
             total_steps=self.cfg.steps,
             lr_warmup_steps=self.cfg.lr_warmup_steps,
+            w_shape=self.cfg.w_shape,
             w_aux=self.cfg.w_aux,
-            w_dino=self.cfg.w_dino,
             w_consistency=self.cfg.w_consistency,
             expert_budget_coeff=self.cfg.expert_budget_coeff,
             compute_penalty_coeff=self.cfg.compute_penalty_coeff,
         )
 
-        # Gradient accumulation: scale loss, accumulate, step every N
         scaled_loss = loss.total / self.cfg.grad_accum_steps
         scaled_loss.backward()
         self._accum_count += 1
@@ -140,7 +135,6 @@ class UnifiedTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
             self.optim.step()
             self.optim.zero_grad(set_to_none=True)
-            self.model.update_target_ema(self.cfg.ema_decay)
             self._accum_count = 0
 
         self.model.router.update_memory(out.reasoner.latent)
@@ -166,29 +160,39 @@ class UnifiedTrainer:
                 and self.cfg.growth_force_interval > 0
                 and step % self.cfg.growth_force_interval == 0
                 and float(loss.exact_match.cpu()) <= self.cfg.growth_force_exact_threshold
-                and self.model.reasoner.active_experts < min(self.cfg.hard_expert_cap, self.model.reasoner.max_experts)
+                and self.model.content_reasoner.active_experts < min(
+                    self.cfg.hard_expert_cap, self.model.content_reasoner.max_experts
+                )
             ):
-                self.model.reasoner.active_experts += 1
+                self.model.content_reasoner.active_experts += 1
                 grown = True
 
         if loss.exact_match.item() < 1.0:
             self.failure_replay.append(episode)
 
+        # Shape accuracy
+        true_h, true_w = episode.test_output.shape
+        pred_h = int(out.shape_h_logits.argmax(dim=-1).item()) + 1
+        pred_w = int(out.shape_w_logits.argmax(dim=-1).item()) + 1
+        shape_correct = float(pred_h == true_h and pred_w == true_w)
+
         return {
             "total": float(loss.total.detach().cpu()),
-            "sft": float(loss.l_sft.detach().cpu()),
+            "content": float(loss.l_content.detach().cpu()),
+            "shape": float(loss.l_shape.detach().cpu()),
             "aux": float(loss.l_aux.detach().cpu()),
-            "dino": float(loss.l_dino.detach().cpu()),
             "consistency": float(loss.l_consistency.detach().cpu()),
             "reward": float(loss.reward.cpu()),
             "exact": float(loss.exact_match.cpu()),
             "pixel_acc": float((out.test_logits.argmax(dim=1).squeeze(0) == episode.test_output).float().mean().cpu()),
+            "shape_correct": shape_correct,
             "lr": current_lr,
             "alpha_sft": float(out.router.alpha_sft.mean().detach().cpu()),
             "alpha_rl": float(out.router.alpha_rl.mean().detach().cpu()),
             "novelty": float(out.router.novelty.mean().detach().cpu()),
             "uncertainty": float(out.router.uncertainty.mean().detach().cpu()),
             "steps_reasoner": float(out.reasoner.steps_used),
+            "steps_shape_reasoner": float(out.shape_reasoner.steps_used),
             "steps_refine": float(out.decoder.refinement_steps),
             "active_experts": float(out.reasoner.active_experts),
             "grew": float(grown),
@@ -200,8 +204,9 @@ class UnifiedTrainer:
         if not self.recent:
             return {}
         keys = [
-            "total", "sft", "aux", "dino", "exact", "pixel_acc",
-            "novelty", "uncertainty", "active_experts", "symbolic_confidence",
+            "total", "content", "shape", "aux", "exact", "pixel_acc",
+            "shape_correct", "novelty", "uncertainty", "active_experts",
+            "symbolic_confidence",
         ]
         out: Dict[str, float] = {}
         n = len(self.recent)
@@ -247,9 +252,10 @@ class UnifiedTrainer:
                     pbar.set_postfix(
                         {
                             "loss": f"{avg.get('total', m['total']):.3f}",
-                            "sft": f"{avg.get('sft', m['sft']):.3f}",
+                            "ct": f"{avg.get('content', m['content']):.3f}",
                             "px": f"{avg.get('pixel_acc', m['pixel_acc']):.3f}",
                             "exact": f"{avg.get('exact', m['exact']):.3f}",
+                            "shp": f"{avg.get('shape_correct', m['shape_correct']):.2f}",
                             "solved%": f"{m['cumulative_solved_pct']:.1f}",
                             "xperts": f"{avg.get('active_experts', m['active_experts']):.0f}",
                             "lr": f"{m['lr']:.1e}",
@@ -259,9 +265,12 @@ class UnifiedTrainer:
                 avg = self._summarize_recent()
                 print(
                     f"step={step} loss={avg.get('total', m['total']):.4f} "
-                    f"sft={avg.get('sft', m['sft']):.3f} aux={avg.get('aux', m.get('aux', 0)):.3f} "
-                    f"dino={avg.get('dino', m['dino']):.3f} px_acc={avg.get('pixel_acc', m['pixel_acc']):.3f} "
+                    f"content={avg.get('content', m['content']):.3f} "
+                    f"shape={avg.get('shape', m['shape']):.3f} "
+                    f"aux={avg.get('aux', m['aux']):.3f} "
+                    f"px_acc={avg.get('pixel_acc', m['pixel_acc']):.3f} "
                     f"exact={avg.get('exact', m['exact']):.3f} "
+                    f"shp_acc={avg.get('shape_correct', m['shape_correct']):.2f} "
                     f"solved%={m['cumulative_solved_pct']:.2f} "
                     f"xperts={avg.get('active_experts', m['active_experts']):.0f} "
                     f"lr={m['lr']:.2e}"

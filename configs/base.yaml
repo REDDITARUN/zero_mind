@@ -6,6 +6,9 @@ model:
   reasoner_depth: 1
   h_cycles: 2
   l_cycles: 2
+  shape_reasoner_depth: 1
+  shape_h_cycles: 1
+  shape_l_cycles: 1
   decoder_refine_steps: 2
   use_mamba: false
 
@@ -21,9 +24,8 @@ train:
   lr_warmup_steps: 20
   lr_min_ratio: 0.05
   grad_accum_steps: 1
-  ema_decay: 0.996
+  w_shape: 0.3
   w_aux: 0.3
-  w_dino: 0.5
   w_consistency: 0.02
   adapt_structure: true
   adapt_interval: 1
