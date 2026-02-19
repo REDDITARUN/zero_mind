@@ -3,13 +3,15 @@ set -e
 
 echo "=== ZERO_MIND Colab Setup ==="
 
-# 1. Clone repo
-if [ ! -d "zero_mind" ]; then
-    git clone https://github.com/REDDITARUN/zero_mind.git
-    cd zero_mind
+# Detect if we're already inside the repo
+if [ -f "colab_setup.sh" ] && [ -f "pyproject.toml" ]; then
+    echo "Already inside zero_mind repo."
 else
-    cd zero_mind
-    git pull
+    echo "ERROR: Run this script from inside the zero_mind repo directory."
+    echo "  git clone https://github.com/REDDITARUN/zero_mind.git"
+    echo "  cd zero_mind"
+    echo "  bash colab_setup.sh"
+    exit 1
 fi
 
 # 2. Install deps
@@ -46,7 +48,8 @@ print(f'PyTorch: {torch.__version__}')
 print(f'CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
-    print(f'Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+    mem = getattr(torch.cuda.get_device_properties(0), 'total_memory', None) or getattr(torch.cuda.get_device_properties(0), 'total_mem', 0)
+    print(f'Memory: {mem / 1e9:.1f} GB')
 else:
     print('WARNING: No GPU detected! Training will be slow.')
 "
@@ -73,5 +76,8 @@ print(f'Smoke test PASSED on {device} | loss={loss.total.item():.3f}')
 
 echo ""
 echo "=== Setup complete! ==="
-echo "To train: python scripts/run_train_with_eval.py --train_config configs/colab_cuda.yaml --eval_config configs/arc_test_eval.yaml"
-echo "Or quick: python scripts/run_train.py --config configs/colab_cuda.yaml"
+echo "To train:"
+echo "  python scripts/run_train_with_eval.py --train_config configs/colab_cuda.yaml --eval_config configs/colab_eval.yaml --eval_every 4000 --eval_steps 200 --eval_pass_k 3"
+echo ""
+echo "Or quick (no eval checkpoints):"
+echo "  python scripts/run_train.py --config configs/colab_cuda.yaml"
