@@ -131,20 +131,39 @@ class UnifiedArcModel(nn.Module):
     def encode_grid(self, grid: torch.Tensor) -> torch.Tensor:
         return self.encoder(grid.unsqueeze(0))
 
+    def _batch_encode(
+        self,
+        train_inputs: List[torch.Tensor],
+        train_outputs: List[torch.Tensor],
+        test_input: torch.Tensor,
+    ) -> tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        """Batch-encode all grids in one GPU call when shapes match."""
+        all_grids = train_inputs + train_outputs + [test_input]
+        shapes = {g.shape for g in all_grids}
+        if len(shapes) == 1:
+            batch = torch.stack(all_grids, dim=0)
+            all_latents = self.encoder(batch)
+            n_in = len(train_inputs)
+            n_out = len(train_outputs)
+            in_lat = [all_latents[i : i + 1] for i in range(n_in)]
+            out_lat = [all_latents[n_in + i : n_in + i + 1] for i in range(n_out)]
+            test_lat = all_latents[n_in + n_out : n_in + n_out + 1]
+            return in_lat, out_lat, test_lat
+
+        in_lat = [self.encode_grid(g) for g in train_inputs]
+        out_lat = [self.encode_grid(g) for g in train_outputs]
+        test_lat = self.encode_grid(test_input)
+        return in_lat, out_lat, test_lat
+
     def forward(
         self,
         train_inputs: List[torch.Tensor],
         train_outputs: List[torch.Tensor],
         test_input: torch.Tensor,
     ) -> UnifiedForwardOutput:
-        train_in_latents, train_out_latents = [], []
-
-        for g in train_inputs:
-            train_in_latents.append(self.encode_grid(g))
-        for g in train_outputs:
-            train_out_latents.append(self.encode_grid(g))
-
-        test_latent = self.encode_grid(test_input)
+        train_in_latents, train_out_latents, test_latent = self._batch_encode(
+            train_inputs, train_outputs, test_input,
+        )
 
         rule_out = self.rule(
             test_latent=test_latent,

@@ -90,6 +90,12 @@ class UnifiedTrainer:
         self._use_amp = cfg.use_amp and cfg.device.startswith("cuda")
         self._amp_dtype = torch.bfloat16
 
+        if cfg.device.startswith("cuda"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            print("CUDA optimizations: TF32 + cudnn.benchmark enabled")
+
         if cfg.compile_model and cfg.device.startswith("cuda"):
             try:
                 self.model = torch.compile(self.model, mode="reduce-overhead")
