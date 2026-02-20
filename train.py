@@ -267,14 +267,14 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     env = ARCGenEnv(
         data_dir=args.data_dir,
         num_augments=args.num_augments,
         curriculum=(args.single_task is None),
     )
-    print(f"Task pool: {len(env)} tasks")
+    print(f"Task pool: {len(env)} tasks", flush=True)
 
     policy = ARCGridPolicy(
         d_model=args.d_model,
@@ -283,10 +283,11 @@ def main():
         n_dec_layers=args.n_dec_layers,
     ).to(device)
     n_params = sum(p.numel() for p in policy.parameters())
-    print(f"Policy params: {n_params:,}")
+    print(f"Policy params: {n_params:,}", flush=True)
 
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    print(f"Starting training: {n_batches} batches x {args.batch_size} episodes", flush=True)
 
     solve_count = 0
     best_reward = -float("inf")
@@ -302,7 +303,7 @@ def main():
         batch_solved = 0
         batch_steps = 0
 
-        for _ in range(args.batch_size):
+        for ep_i in range(args.batch_size):
             ep = collect_episode(
                 env, policy, device,
                 task_index=args.single_task,
@@ -314,6 +315,11 @@ def main():
                 batch_solved += 1
                 solve_count += 1
             total_episodes += 1
+
+            if batch_idx <= 2:
+                print(f"  B{batch_idx} ep {ep_i+1}/{args.batch_size}: "
+                      f"steps={len(ep.actions)} R={sum(ep.rewards):+.2f} "
+                      f"task={ep.task_id[:8]}", flush=True)
 
         # PPO update
         metrics = ppo_update(
@@ -327,7 +333,7 @@ def main():
         if mean_reward > best_reward:
             best_reward = mean_reward
 
-        if batch_idx % args.log_interval == 0 or batch_solved > 0:
+        if batch_idx % args.log_interval == 0 or batch_solved > 0 or batch_idx <= 2:
             elapsed = time.time() - start_time
             task_ids = set(ep.task_id for ep in episodes)
             tasks_str = ",".join(sorted(task_ids)[:3])
@@ -339,7 +345,8 @@ def main():
                 f"solved={batch_solved}/{args.batch_size} | total_solved={solve_count} | "
                 f"steps={batch_steps/args.batch_size:.0f} | "
                 f"ent={metrics['entropy']:.2f} | {elapsed:.0f}s | "
-                f"tasks={tasks_str}"
+                f"tasks={tasks_str}",
+                flush=True,
             )
 
         if batch_solved > 0:
@@ -355,7 +362,7 @@ def main():
                 "n_dec_layers": args.n_dec_layers,
                 "single_task": args.single_task,
             }, path)
-            print(f"  Saved: {path}")
+            print(f"  Saved: {path}", flush=True)
 
         # Curriculum update
         if env.sampler:
@@ -365,7 +372,7 @@ def main():
         # Periodic stats
         if batch_idx % (args.log_interval * 10) == 0 and env.sampler:
             stats = env.sampler.stats()
-            print(f"  Curriculum: {stats}")
+            print(f"  Curriculum: {stats}", flush=True)
 
     # Save final model
     final_path = os.path.join(args.checkpoint_dir, "policy_gen_final.pt")
@@ -378,7 +385,7 @@ def main():
         "n_enc_layers": args.n_enc_layers,
         "n_dec_layers": args.n_dec_layers,
     }, final_path)
-    print(f"Final: {final_path} | Solves: {solve_count}/{total_episodes}")
+    print(f"Final: {final_path} | Solves: {solve_count}/{total_episodes}", flush=True)
 
 
 if __name__ == "__main__":
