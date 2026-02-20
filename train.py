@@ -305,6 +305,12 @@ def main():
 
         t_collect = time.time()
         for ep_i in range(args.batch_size):
+            filled = ep_i + 1
+            bar_len = 20
+            done_len = int(bar_len * filled / args.batch_size)
+            bar = "█" * done_len + "░" * (bar_len - done_len)
+            print(f"\r  B{batch_idx}/{n_batches} collect [{bar}] {filled}/{args.batch_size}", end="", flush=True)
+
             ep = collect_episode(
                 env, policy, device,
                 task_index=args.single_task,
@@ -317,6 +323,7 @@ def main():
                 solve_count += 1
             total_episodes += 1
         collect_sec = time.time() - t_collect
+        print(f"\r  B{batch_idx}/{n_batches} collect [{'█' * bar_len}] done in {collect_sec:.0f}s, PPO...", end="", flush=True)
 
         # PPO update
         t_ppo = time.time()
@@ -327,23 +334,24 @@ def main():
             gamma=args.gamma,
         )
         ppo_sec = time.time() - t_ppo
+        print("\r" + " " * 80 + "\r", end="", flush=True)
 
         mean_reward = np.mean(batch_rewards)
         if mean_reward > best_reward:
             best_reward = mean_reward
 
         elapsed = time.time() - start_time
-        task_ids = set(ep.task_id for ep in episodes)
-        tasks_str = ",".join(sorted(task_ids)[:3])
-        if len(task_ids) > 3:
-            tasks_str += f"...+{len(task_ids)-3}"
+        eta = elapsed / batch_idx * (n_batches - batch_idx)
+        eta_m, eta_s = divmod(int(eta), 60)
+        eta_h, eta_m = divmod(eta_m, 60)
         print(
-            f"B{batch_idx:5d} | ep={total_episodes:6d} | "
+            f"B{batch_idx:5d}/{n_batches} | ep={total_episodes:6d} | "
             f"R={mean_reward:+6.2f} | best={best_reward:+6.2f} | "
-            f"solved={batch_solved}/{args.batch_size} | total_solved={solve_count} | "
+            f"solved={batch_solved}/{args.batch_size} total={solve_count} | "
             f"steps={batch_steps/args.batch_size:.0f} | "
             f"ent={metrics['entropy']:.2f} | "
-            f"col={collect_sec:.0f}s ppo={ppo_sec:.0f}s | {elapsed:.0f}s",
+            f"col={collect_sec:.0f}s ppo={ppo_sec:.0f}s | "
+            f"ETA {eta_h}h{eta_m:02d}m",
             flush=True,
         )
 
