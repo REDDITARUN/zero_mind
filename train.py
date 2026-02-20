@@ -303,6 +303,7 @@ def main():
         batch_solved = 0
         batch_steps = 0
 
+        t_collect = time.time()
         for ep_i in range(args.batch_size):
             ep = collect_episode(
                 env, policy, device,
@@ -315,39 +316,36 @@ def main():
                 batch_solved += 1
                 solve_count += 1
             total_episodes += 1
-
-            if batch_idx <= 2:
-                print(f"  B{batch_idx} ep {ep_i+1}/{args.batch_size}: "
-                      f"steps={len(ep.actions)} R={sum(ep.rewards):+.2f} "
-                      f"task={ep.task_id[:8]}", flush=True)
+        collect_sec = time.time() - t_collect
 
         # PPO update
+        t_ppo = time.time()
         metrics = ppo_update(
             policy, optimizer, episodes, device,
             n_epochs=args.n_ppo_epochs,
             entropy_coef=args.entropy_coef,
             gamma=args.gamma,
         )
+        ppo_sec = time.time() - t_ppo
 
         mean_reward = np.mean(batch_rewards)
         if mean_reward > best_reward:
             best_reward = mean_reward
 
-        if batch_idx % args.log_interval == 0 or batch_solved > 0 or batch_idx <= 2:
-            elapsed = time.time() - start_time
-            task_ids = set(ep.task_id for ep in episodes)
-            tasks_str = ",".join(sorted(task_ids)[:3])
-            if len(task_ids) > 3:
-                tasks_str += f"...+{len(task_ids)-3}"
-            print(
-                f"B{batch_idx:5d} | ep={total_episodes:6d} | "
-                f"R={mean_reward:+6.2f} | best={best_reward:+6.2f} | "
-                f"solved={batch_solved}/{args.batch_size} | total_solved={solve_count} | "
-                f"steps={batch_steps/args.batch_size:.0f} | "
-                f"ent={metrics['entropy']:.2f} | {elapsed:.0f}s | "
-                f"tasks={tasks_str}",
-                flush=True,
-            )
+        elapsed = time.time() - start_time
+        task_ids = set(ep.task_id for ep in episodes)
+        tasks_str = ",".join(sorted(task_ids)[:3])
+        if len(task_ids) > 3:
+            tasks_str += f"...+{len(task_ids)-3}"
+        print(
+            f"B{batch_idx:5d} | ep={total_episodes:6d} | "
+            f"R={mean_reward:+6.2f} | best={best_reward:+6.2f} | "
+            f"solved={batch_solved}/{args.batch_size} | total_solved={solve_count} | "
+            f"steps={batch_steps/args.batch_size:.0f} | "
+            f"ent={metrics['entropy']:.2f} | "
+            f"col={collect_sec:.0f}s ppo={ppo_sec:.0f}s | {elapsed:.0f}s",
+            flush=True,
+        )
 
         if batch_solved > 0:
             path = os.path.join(args.checkpoint_dir,
