@@ -287,7 +287,6 @@ def main():
 
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    print(f"Starting training: {n_batches} batches x {args.batch_size} episodes", flush=True)
 
     solve_count = 0
     best_reward = -float("inf")
@@ -295,6 +294,7 @@ def main():
     start_time = time.time()
 
     n_batches = args.max_episodes // args.batch_size
+    print(f"Starting training: {n_batches} batches x {args.batch_size} episodes", flush=True)
 
     for batch_idx in range(1, n_batches + 1):
         # Collect batch of episodes
