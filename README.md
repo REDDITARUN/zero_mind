@@ -1,113 +1,80 @@
-# ZERO_MIND — Brain-Inspired ARC-AGI Solver
+# ZERO MIND — RL Agent for ARC-AGI
 
-A unified architecture for ARC-AGI tasks that goes beyond reward-only learning, combining self-supervised representation learning, hierarchical latent-space reasoning, and diffusion-style self-correction in a single end-to-end system.
+A reinforcement learning agent that learns to solve [ARC-AGI](https://arcprize.org/) tasks via **autoregressive grid generation**. The agent predicts the output grid dimensions (height, width) then fills each cell sequentially, trained end-to-end with PPO.
 
 ## Architecture
 
-- **I-JEPA Encoder** — Self-supervised latent representations via EMA target encoder + masked prediction with 2D RoPE
-- **Cross-Attention Rule Extractor** — Infers transformation rules from few input/output example pairs
-- **TRM/HRM Reasoner** — Hierarchical H/L-cycle iterative reasoning in latent space with adaptive halting (Q-head) and dynamic expert capacity
-- **Diffusion Decoder** — Iterative refinement for self-correcting grid generation
-- **Novelty Router** — Automatically switches between SFT (novel tasks) and RL (familiar tasks) objectives
-- **Neurosymbolic Primitives** — Blends symbolic rule predictions with neural output
-- **Adaptive Network** — Grows/prunes expert capacity based on task complexity; smaller network = more reward
+- **Environment** (`arc_env/gen_env.py`): Gymnasium env where the agent generates grids in 3 phases — predict H → predict W → fill cells left-to-right, top-to-bottom.
+- **Policy** (`arc_policy.py`): Encoder-decoder Transformer. The encoder processes tokenized demo pairs + test input; the decoder autoregressively generates the output grid.
+- **Training** (`train.py`): Batched PPO with GAE, curriculum sampling, gradient clipping, and per-task checkpointing.
 
-## Quick Start (Local)
+## Quick Setup
 
 ```bash
-pip install -r requirements.txt
-python scripts/run_train.py --config configs/base.yaml
-```
-
-## Colab / GPU Training
-
-One-liner to set up and run on Colab (paste in terminal):
-
-```bash
-!git clone https://github.com/REDDITARUN/zero_mind.git && cd zero_mind && bash colab_setup.sh
-```
-
-Or step by step:
-
-```bash
-# 1. Clone and setup
 git clone https://github.com/REDDITARUN/zero_mind.git
 cd zero_mind
-bash colab_setup.sh
 
-# 2. Train (24k steps, ~2-3 hrs on T4)
-python scripts/run_train_with_eval.py \
-  --train_config configs/colab_cuda.yaml \
-  --eval_config configs/colab_eval.yaml \
-  --eval_every 4000 \
-  --eval_steps 200 \
-  --eval_pass_k 3
+# Get ARC data
+git clone https://github.com/fchollet/ARC-AGI.git
+git clone https://github.com/arcprize/ARC-AGI-2.git
 
-# 3. Evaluate checkpoint
-python scripts/run_eval.py \
-  --config configs/colab_eval.yaml \
-  --checkpoint checkpoints/unified_arc_colab.pt \
-  --max_eval_steps 400 \
-  --pass_k 3
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate   # Linux/Mac
+# .venv\Scripts\activate    # Windows
 
-# 4. Per-task breakdown
-python scripts/eval_taskwise.py \
-  --config configs/colab_eval.yaml \
-  --checkpoint checkpoints/unified_arc_colab.pt \
-  --max_eval_steps 400 \
-  --out_file reports/taskwise_eval.jsonl
+pip install -r requirements.txt
 ```
 
-### Resume Training
+## Usage
+
+### Train on a single task (sanity check)
 
 ```bash
-python scripts/run_train_with_eval.py \
-  --train_config configs/colab_cuda.yaml \
-  --eval_config configs/colab_eval.yaml \
-  --load_checkpoint checkpoints/unified_arc_colab.pt
+python train.py --single-task 52 --max-episodes 2000 --d-model 64 --n-heads 4 --n-enc-layers 2 --n-dec-layers 2
 ```
 
-## Training Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/run_train.py` | Basic training loop |
-| `scripts/run_train_with_eval.py` | Training with periodic ARC eval + checkpoints |
-| `scripts/run_eval.py` | Evaluate checkpoint (episode or task-level with pass@K) |
-| `scripts/eval_taskwise.py` | Per-task eval report with router/symbolic diagnostics |
-| `scripts/run_infer.py` | Run inference on ARC tasks |
-| `scripts/visualize_inference.py` | Save human-readable inference previews |
-| `scripts/build_augmented_arc_episodes.py` | Build augmented episode dataset from ARC JSON |
-| `scripts/summarize_metrics.py` | Summarize training metrics JSONL |
-| `scripts/arc_data_report.py` | Report on ARC data splits |
-
-## Configs
-
-| Config | Use Case |
-|--------|----------|
-| `configs/base.yaml` | Quick smoke test (CPU) |
-| `configs/colab_cuda.yaml` | Full GPU training (Colab T4/A100) |
-| `configs/colab_eval.yaml` | Evaluation on GPU |
-| `configs/serious_arc_v2.yaml` | Long local training |
-| `configs/arc_test_eval.yaml` | Evaluation on ARC evaluation split (CPU) |
-
-## Monitoring Training
-
-Progress bar shows: loss, exact match rate, cumulative solved %, active experts.
-
-Per-step console logs include router weights (`router_sft`/`router_rl`), effective SFT/RL mix, and exploration state.
-
-Full metrics trace: set `train.metrics_jsonl_path` in config, then:
+### Train on all 400 tasks
 
 ```bash
-python scripts/summarize_metrics.py --metrics_file logs/colab_cuda_metrics.jsonl
+python train.py --batch-size 16 --max-episodes 100000
 ```
 
-## Core Design
+### Interactive play
 
-- Single forward pass activates all modules every step
-- Router outputs soft `alpha_sft`, `alpha_rl` weights — no hard switching
-- `L_total = eff_sft * L_sft + w_qhalt * L_qhalt + w_ijepa * L_ijepa + w_eff * L_eff + w_route * L_route + w_consistency * L_consistency`
-- One backward pass updates encoder, cross-attention, router, reasoner, and decoder together
-- I-JEPA target encoder updated via EMA (no extra gradient cost)
-- Network grows/contracts experts based on performance — efficiency is rewarded
+```bash
+python play_arc.py --show-target
+```
+
+### Visualize a trained agent
+
+```bash
+python visualize_run.py
+```
+
+## Project Structure
+
+```
+├── arc_env/
+│   ├── gen_env.py          # Autoregressive grid generation environment
+│   ├── env.py              # Original canvas-based environment (legacy)
+│   ├── augment.py          # Task loading + geometric augmentation
+│   ├── curriculum.py       # Adaptive task sampler
+│   ├── rewards.py          # Reward calculator (legacy env)
+│   ├── renderer.py         # ANSI grid rendering
+│   └── policy.py           # CNN+Transformer policy (legacy env)
+├── arc_policy.py           # Encoder-decoder Transformer policy
+├── train.py                # PPO training loop
+├── train_single_task.py    # Single-task training (legacy env)
+├── play_arc.py             # Interactive play
+├── visualize_run.py        # GIF generation from checkpoints
+└── requirements.txt
+```
+
+## How It Works
+
+1. **Tokenization**: Demo input/output pairs and the test input are converted into a flat token sequence with special separator tokens and 2D positional embeddings.
+2. **Encoding**: A Transformer encoder processes the full context bidirectionally.
+3. **Decoding**: The decoder predicts output height (1-30), then width (1-30), then each cell color (0-9) autoregressively with causal masking.
+4. **Reward**: +1 for correct H/W, per-cell shaped rewards during generation, +5 terminal bonus for perfect solve.
+5. **PPO**: Standard clipped PPO with GAE, entropy bonus, and gradient clipping trains the policy end-to-end.

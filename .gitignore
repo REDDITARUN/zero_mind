@@ -6,31 +6,34 @@ dist/
 build/
 *.egg
 
-# Data (large files -- regenerated on Colab)
-data/*.jsonl
+# Virtual environment
+.venv/
+venv/
+env/
 
-# References (cloned separately on Colab)
-References/
-
-# Checkpoints and logs (generated during training)
+# Checkpoints & model artifacts
 checkpoints/
-logs/
-reports/
+*.pt
+*.pth
+*.ckpt
 
-# Inference previews
-inference_preview*.txt
+# Generated assets
+*.gif
 
-# OS
+# Data (cloned separately as submodules)
+ARC-AGI/
+ARC-AGI-2/
+
+# IDE / OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Env
-.env
-.venv/
-venv/
+# Old project files (removed)
+src/
+configs/
+scripts/
+tests/
+colab_setup.sh
+pyproject.toml
