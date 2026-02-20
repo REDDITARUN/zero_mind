@@ -60,10 +60,10 @@ class ArcSimulator:
         out = grid.clone()
         if axis == 0:
             half = h // 2
-            out[half:, :] = torch.flip(out[:half, :], dims=[0])
+            out[half + (h % 2):, :] = torch.flip(out[:half, :], dims=[0])
         else:
             half = w // 2
-            out[:, half:] = torch.flip(out[:, :half], dims=[1])
+            out[:, half + (w % 2):] = torch.flip(out[:, :half], dims=[1])
         return out
 
     def _noise(self, grid: Grid, amount: float = 0.1) -> Grid:
