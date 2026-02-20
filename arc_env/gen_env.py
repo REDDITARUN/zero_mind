@@ -47,6 +47,7 @@ class ARCGenEnv(gym.Env):
         curriculum: bool = True,
         eval_mode: bool = False,
         max_gen_cells: int = 900,
+        max_output_cells: int | None = None,
     ):
         super().__init__()
 
@@ -57,6 +58,14 @@ class ARCGenEnv(gym.Env):
                     t["task_id"] = "unknown"
         else:
             self._pool = build_augmented_pool(data_dir, num_augments)
+
+        if max_output_cells is not None:
+            before = len(self._pool)
+            self._pool = [
+                t for t in self._pool
+                if len(t["test"][0]["output"]) * len(t["test"][0]["output"][0]) <= max_output_cells
+            ]
+            print(f"Filtered tasks: {before} -> {len(self._pool)} (max_output_cells={max_output_cells})", flush=True)
 
         self._curriculum = curriculum
         self._eval_mode = eval_mode

@@ -256,6 +256,10 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--n-ppo-epochs", type=int, default=4)
     parser.add_argument("--num-augments", type=int, default=1)
+    parser.add_argument("--max-output-cells", type=int, default=None,
+                        help="Only train on tasks with output ≤ this many cells (e.g. 100)")
+    parser.add_argument("--staged-curriculum", action="store_true",
+                        help="Auto-expand task pool: start small, grow as agent solves")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-enc-layers", type=int, default=4)
@@ -269,10 +273,22 @@ def main():
     device = torch.device(args.device)
     print(f"Device: {device}", flush=True)
 
+    # Staged curriculum: start with tiny tasks, expand as agent learns
+    STAGES = [25, 50, 100, 200, 400, 900]
+    if args.staged_curriculum:
+        current_stage = 0
+        max_cells = STAGES[current_stage]
+        stage_solves_needed = 3
+        print(f"Staged curriculum: starting with max_output_cells={max_cells}", flush=True)
+    else:
+        current_stage = -1
+        max_cells = args.max_output_cells
+
     env = ARCGenEnv(
         data_dir=args.data_dir,
         num_augments=args.num_augments,
         curriculum=(args.single_task is None),
+        max_output_cells=max_cells,
     )
     print(f"Task pool: {len(env)} tasks", flush=True)
 
@@ -379,6 +395,21 @@ def main():
         if batch_idx % (args.log_interval * 10) == 0 and env.sampler:
             stats = env.sampler.stats()
             print(f"  Curriculum: {stats}", flush=True)
+
+        # Staged curriculum: expand to harder tasks when agent starts solving
+        if args.staged_curriculum and current_stage < len(STAGES) - 1:
+            if solve_count >= stage_solves_needed:
+                current_stage += 1
+                max_cells = STAGES[current_stage]
+                stage_solves_needed = solve_count + 5 * (current_stage + 1)
+                print(f"\n  >>> STAGE UP: max_output_cells={max_cells} (next expand at {stage_solves_needed} solves)", flush=True)
+                env = ARCGenEnv(
+                    data_dir=args.data_dir,
+                    num_augments=args.num_augments,
+                    curriculum=(args.single_task is None),
+                    max_output_cells=max_cells,
+                )
+                print(f"  Task pool: {len(env)} tasks\n", flush=True)
 
     # Save final model
     final_path = os.path.join(args.checkpoint_dir, "policy_gen_final.pt")
