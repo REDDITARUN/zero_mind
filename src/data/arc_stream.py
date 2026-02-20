@@ -22,13 +22,13 @@ class ArcStreamConfig:
     require_test_output: bool = True
     max_grid_size: int = 30
     sim_grid_min_size: int = 6
-    sim_grid_max_size: int = 12
+    sim_grid_max_size: int = 18
     sim_num_colors: int = 10
     sim_min_train_pairs: int = 2
-    sim_max_train_pairs: int = 3
+    sim_max_train_pairs: int = 4
     sim_allowed_rules: list[str] | None = None
     episodes_file: str = ""
-    mixed_arc_ratio: float = 0.35
+    mixed_arc_ratio: float = 0.5
 
 
 def _to_tensor_grid(grid: List[List[int]], device: torch.device) -> torch.Tensor:
@@ -55,91 +55,58 @@ def stream_from_arc_json(
     while True:
         rng.shuffle(task_files)
         for file in task_files:
-            task = json.loads(file.read_text())
-            train_pairs = task["train"]
-            test_pairs = task["test"]
-            # ARC typically has one test sample; if many exist, sample one.
-            chosen_test = rng.choice(test_pairs)
-            if require_test_output and "output" not in chosen_test:
-                continue
-
-            train_inputs = [_to_tensor_grid(p["input"], device) for p in train_pairs]
-            train_outputs = [_to_tensor_grid(p["output"], device) for p in train_pairs]
-            test_input = _to_tensor_grid(chosen_test["input"], device)
-            test_output = _to_tensor_grid(chosen_test["output"], device) if "output" in chosen_test else torch.zeros_like(test_input)
-
-            if test_input.shape[0] > max_grid_size or test_input.shape[1] > max_grid_size:
-                continue
-            if test_output.shape[0] > max_grid_size or test_output.shape[1] > max_grid_size:
-                continue
-            if same_shape_only and test_input.shape != test_output.shape:
-                continue
-
-            yield ArcEpisode(
-                train_inputs=train_inputs,
-                train_outputs=train_outputs,
-                test_input=test_input,
-                test_output=test_output,
-                rule_name=file.stem,
-            )
-
-
-def stream_from_episode_jsonl(
-    episodes_file: str,
-    device: torch.device,
-    seed: int,
-    same_shape_only: bool = False,
-    max_grid_size: int = 30,
-) -> Generator[ArcEpisode, None, None]:
-    path = Path(episodes_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Episodes file not found: {path}")
-    rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
-    if not rows:
-        raise ValueError(
-            f"Episodes file is empty: {path}. "
-            "Rebuild episodes with a valid ARC data path before training."
-        )
-    rng = random.Random(seed)
-    while True:
-        rng.shuffle(rows)
-        for row in rows:
-            train_inputs = [_to_tensor_grid(g, device) for g in row["train_inputs"]]
-            train_outputs = [_to_tensor_grid(g, device) for g in row["train_outputs"]]
-            test_input = _to_tensor_grid(row["test_input"], device)
-            test_output = _to_tensor_grid(row["test_output"], device)
-            if test_input.shape[0] > max_grid_size or test_input.shape[1] > max_grid_size:
-                continue
-            if test_output.shape[0] > max_grid_size or test_output.shape[1] > max_grid_size:
-                continue
-            if same_shape_only and test_input.shape != test_output.shape:
-                continue
-            if same_shape_only:
-                if any(i.shape != o.shape for i, o in zip(train_inputs, train_outputs)):
+            try:
+                task = json.loads(file.read_text())
+                train_pairs = task["train"]
+                test_pairs = task["test"]
+                # ARC typically has one test sample; if many exist, sample one.
+                chosen_test = rng.choice(test_pairs)
+                if require_test_output and "output" not in chosen_test:
                     continue
-            yield ArcEpisode(
-                train_inputs=train_inputs,
-                train_outputs=train_outputs,
-                test_input=test_input,
-                test_output=test_output,
-                rule_name=row.get("rule_name", "episode"),
-            )
+
+                train_inputs = [_to_tensor_grid(p["input"], device) for p in train_pairs]
+                train_outputs = [_to_tensor_grid(p["output"], device) for p in train_pairs]
+                test_input = _to_tensor_grid(chosen_test["input"], device)
+                test_output = _to_tensor_grid(chosen_test["output"], device) if "output" in chosen_test else torch.zeros_like(test_input)
+
+                if test_input.shape[0] > max_grid_size or test_input.shape[1] > max_grid_size:
+                    continue
+                if test_output.shape[0] > max_grid_size or test_output.shape[1] > max_grid_size:
+                    continue
+                if same_shape_only and test_input.shape != test_output.shape:
+                    continue
+                if same_shape_only:
+                    if any(i.shape != o.shape for i, o in zip(train_inputs, train_outputs)):
+                        continue
+
+                yield ArcEpisode(
+                    train_inputs=train_inputs,
+                    train_outputs=train_outputs,
+                    test_input=test_input,
+                    test_output=test_output,
+                    rule_name=file.stem,
+                )
+            except Exception:
+                continue
 
 
 def make_episode_stream(
     cfg: ArcStreamConfig,
     device: torch.device,
 ) -> Generator[ArcEpisode, None, None]:
+    
+    # Create simulator
+    simulator = ArcSimulator(
+        grid_min_size=cfg.sim_grid_min_size,
+        grid_max_size=cfg.sim_grid_max_size,
+        num_colors=cfg.sim_num_colors,
+        train_pairs_range=(cfg.sim_min_train_pairs, cfg.sim_max_train_pairs),
+        allowed_rules=cfg.sim_allowed_rules,
+        device=device,
+        seed=cfg.seed,
+    )
+
     if cfg.source == "simulator":
-        simulator = ArcSimulator(
-            grid_min_size=cfg.sim_grid_min_size,
-            grid_max_size=cfg.sim_grid_max_size,
-            num_colors=cfg.sim_num_colors,
-            train_pairs_range=(cfg.sim_min_train_pairs, cfg.sim_max_train_pairs),
-            allowed_rules=cfg.sim_allowed_rules,
-            device=device,
-            seed=cfg.seed,
-        )
         for _ in range(cfg.max_steps):
             yield simulator.sample_episode()
         return
@@ -161,23 +128,11 @@ def make_episode_stream(
             yield ep
         return
 
-    if cfg.source == "episodes_jsonl":
-        steps = 0
-        for ep in stream_from_episode_jsonl(
-            cfg.episodes_file,
-            device=device,
-            seed=cfg.seed,
-            same_shape_only=cfg.same_shape_only,
-            max_grid_size=cfg.max_grid_size,
-        ):
-            if steps >= cfg.max_steps:
-                break
-            steps += 1
-            yield ep
-        return
-
     if cfg.source == "mixed":
+        # Mix Simulator + Real ARC JSON
         rng = random.Random(cfg.seed)
+        
+        # Infinite generator for ARC tasks
         arc_stream = stream_from_arc_json(
             cfg.arc_data_dir,
             cfg.split,
@@ -187,19 +142,29 @@ def make_episode_stream(
             require_test_output=cfg.require_test_output,
             max_grid_size=cfg.max_grid_size,
         )
-        ep_stream = stream_from_episode_jsonl(
-            cfg.episodes_file,
-            device=device,
-            seed=cfg.seed + 29,
-            same_shape_only=cfg.same_shape_only,
-            max_grid_size=cfg.max_grid_size,
-        )
+        
         arc_ratio = max(0.0, min(1.0, cfg.mixed_arc_ratio))
+        
         for _ in range(cfg.max_steps):
             if rng.random() < arc_ratio:
-                yield next(arc_stream)
+                # Real ARC task
+                try:
+                    yield next(arc_stream)
+                except StopIteration:
+                    # Restart stream if exhausted (shouldn't happen with while True)
+                    arc_stream = stream_from_arc_json(
+                        cfg.arc_data_dir,
+                        cfg.split,
+                        device=device,
+                        seed=cfg.seed + random.randint(0, 10000),
+                        same_shape_only=cfg.same_shape_only,
+                        require_test_output=cfg.require_test_output,
+                        max_grid_size=cfg.max_grid_size,
+                    )
+                    yield next(arc_stream)
             else:
-                yield next(ep_stream)
+                # Procedural task
+                yield simulator.sample_episode()
         return
 
     raise ValueError(f"Unknown source: {cfg.source}")
